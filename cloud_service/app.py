@@ -40,6 +40,7 @@ from cloud_service.signaling import (
     ConnectionManager,
     heartbeat_eviction_loop,
     robot_ws_handler,
+    user_ws_handler,
 )
 from common.logging import configure_logging, get_logger
 from common.schemas import (
@@ -204,6 +205,19 @@ def create_app(public_url: str = "http://localhost:8000") -> FastAPI:
             ws=ws,
             robot_id=robot_id,
             registry=app.state.registry,
+            connections=app.state.connections,
+        )
+
+    # ----- WebSocket: /ws/user/{session_id} ------------------------------
+    # The user's signaling channel. In step 5 (now) the connection is
+    # accepted but the cloud doesn't send anything on it; step 6 fills in
+    # the session_start / session_live dispatch logic.
+
+    @app.websocket("/ws/user/{session_id}")
+    async def user_signaling(ws: WebSocket, session_id: str):
+        await user_ws_handler(
+            ws=ws,
+            session_id=session_id,
             connections=app.state.connections,
         )
 

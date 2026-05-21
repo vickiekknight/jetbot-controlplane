@@ -68,7 +68,13 @@ _signaling_decoder = TypeAdapter(SignalingMessage)
 
 class ConnectionManager:
     """
-    Tracks active WebSocket connections, keyed by robot_id.
+    Tracks active WebSocket connections, keyed by robot_id and session_id.
+
+    Two parallel dicts because robot connections and user connections are
+    addressed differently — a robot is uniquely identified by its robot_id,
+    a user is identified by the session_id the cloud minted for them.
+    Looking up the "user for this session" is therefore O(1) without
+    indirection through a robot.
 
     Thread/task safety: methods are async but all mutations happen on the
     event loop thread, so no explicit locking is needed. The registry
@@ -77,15 +83,12 @@ class ConnectionManager:
     """
 
     def __init__(self):
-        self._connections: dict[str, WebSocket] = {}
+        self._robots: dict[str, WebSocket] = {}
+        self._users: dict[str, WebSocket] = {}
 
-    async def attach(self, robot_id: str, ws: WebSocket) -> None:
-        """
-        Register a WebSocket as the active connection for robot_id.
-        If a prior WebSocket existed for this robot_id, it is closed —
-        matching the replace-on-duplicate policy from registration.
-        """
-        prior = self._connections.get(robot_id)
+    async def attach_robot(self, robot_id: str, ws: WebSocket) -> None:
+        """Register a WebSocket as the active connection for a robot."""
+        prior = self._robots.get(robot_id)
         if prior is not None:
             _log.warning(
                 f"robot {robot_id!r} reconnected; closing prior WebSocket"
@@ -93,18 +96,50 @@ class ConnectionManager:
             try:
                 await prior.close(code=1001, reason="Replaced by new connection")
             except Exception:
-                pass  # prior socket may already be in a bad state
-        self._connections[robot_id] = ws
+                pass
+        self._robots[robot_id] = ws
 
-    def detach(self, robot_id: str) -> None:
-        """Remove the WebSocket entry for a robot. Idempotent."""
-        self._connections.pop(robot_id, None)
+    def detach_robot(self, robot_id: str) -> None:
+        self._robots.pop(robot_id, None)
 
-    def get(self, robot_id: str) -> Optional[WebSocket]:
-        return self._connections.get(robot_id)
+    def get_robot(self, robot_id: str) -> Optional[WebSocket]:
+        return self._robots.get(robot_id)
+
+    async def attach_user(self, session_id: str, ws: WebSocket) -> None:
+        """Register a WebSocket as the active connection for a user session."""
+        prior = self._users.get(session_id)
+        if prior is not None:
+            _log.warning(
+                f"user session {session_id!r} reconnected; closing prior WebSocket"
+            )
+            try:
+                await prior.close(code=1001, reason="Replaced by new connection")
+            except Exception:
+                pass
+        self._users[session_id] = ws
+
+    def detach_user(self, session_id: str) -> None:
+        self._users.pop(session_id, None)
+
+    def get_user(self, session_id: str) -> Optional[WebSocket]:
+        return self._users.get(session_id)
 
     def __len__(self) -> int:
-        return len(self._connections)
+        return len(self._robots) + len(self._users)
+
+
+# Backwards-compatible aliases so the existing robot_ws_handler keeps working
+# (it calls attach/detach/get). We can drop these in step 6 when refactoring.
+def _robot_attach(mgr: ConnectionManager, robot_id: str, ws: WebSocket):
+    return mgr.attach_robot(robot_id, ws)
+
+
+def _robot_detach(mgr: ConnectionManager, robot_id: str):
+    mgr.detach_robot(robot_id)
+
+
+def _robot_get(mgr: ConnectionManager, robot_id: str):
+    return mgr.get_robot(robot_id)
 
 
 async def robot_ws_handler(
@@ -137,7 +172,7 @@ async def robot_ws_handler(
         await ws.close(code=4004, reason="Robot not registered")
         return
 
-    await connections.attach(robot_id, ws)
+    await connections.attach_robot(robot_id, ws)
     _log.info(f"robot {robot_id!r} signaling WebSocket connected")
 
     try:
@@ -166,9 +201,50 @@ async def robot_ws_handler(
     except Exception:
         _log.exception(f"robot {robot_id!r} signaling WebSocket error")
     finally:
-        connections.detach(robot_id)
+        connections.detach_robot(robot_id)
         # We mark offline rather than removing entirely; see module docstring.
         registry.mark_offline(robot_id)
+
+
+async def user_ws_handler(
+    ws: WebSocket,
+    session_id: str,
+    connections: ConnectionManager,
+) -> None:
+    """
+    Per-user-session WebSocket handler.
+
+    In step 5 (this step), the handler just accepts the connection, attaches
+    it to the ConnectionManager, and parks. The cloud doesn't send anything
+    on this channel yet — that work is step 6's session signaling.
+
+    Why open it at all today? Two reasons:
+      1. End-to-end testability: the `user connect` command can be exercised
+         against a real cloud, and we verify it reaches the right endpoint.
+      2. Slot for step 6: when session signaling lands, every piece (URL,
+         routing, lifecycle) is already wired; only the message-handler
+         logic needs to be added.
+
+    Note: session validation (does this session_id correspond to a real
+    pending session?) is deferred to step 6 along with the rest of the
+    session lifecycle.
+    """
+    await ws.accept()
+    await connections.attach_user(session_id, ws)
+    _log.info(f"user session {session_id!r} signaling WebSocket connected")
+
+    try:
+        while True:
+            raw = await ws.receive_text()
+            # User-initiated signaling messages (peer_ready) arrive in step 6.
+            # Today we log and drop anything inbound.
+            _log.debug(f"user {session_id!r} sent inbound message: {raw!r}")
+    except WebSocketDisconnect:
+        _log.info(f"user session {session_id!r} signaling WebSocket disconnected")
+    except Exception:
+        _log.exception(f"user session {session_id!r} signaling WebSocket error")
+    finally:
+        connections.detach_user(session_id)
 
 
 async def heartbeat_eviction_loop(
@@ -201,13 +277,13 @@ async def heartbeat_eviction_loop(
                     )
                     registry.mark_offline(r.robot_id)
                     # If we still hold a WebSocket reference, drop it too.
-                    ws = connections.get(r.robot_id)
+                    ws = connections.get_robot(r.robot_id)
                     if ws is not None:
                         try:
                             await ws.close(code=1001, reason="Heartbeat timeout")
                         except Exception:
                             pass
-                        connections.detach(r.robot_id)
+                        connections.detach_robot(r.robot_id)
         except asyncio.CancelledError:
             _log.info("heartbeat eviction loop stopped")
             raise

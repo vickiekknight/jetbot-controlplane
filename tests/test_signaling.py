@@ -155,6 +155,18 @@ async def test_connection_manager_replace_closes_prior():
     assert ws1.closed is True
     assert mgr.get("robot-1") is ws2
 
+@pytest.mark.asyncio
+async def test_connection_manager_user_sessions_are_independent_of_robots():
+    """attach_user / attach_robot key into different dicts."""
+    mgr = ConnectionManager()
+    robot_ws = object()
+    user_ws = object()
+    await mgr.attach_robot("robot-1", robot_ws)  # type: ignore[arg-type]
+    await mgr.attach_user("sess_abc", user_ws)  # type: ignore[arg-type]
+    assert mgr.get_robot("robot-1") is robot_ws
+    assert mgr.get_user("sess_abc") is user_ws
+    assert mgr.get_robot("sess_abc") is None  # not cross-contaminated
+    assert mgr.get_user("robot-1") is None
 
 # =============================================================================
 # Heartbeat eviction loop (logic-only test, no real WebSockets)
