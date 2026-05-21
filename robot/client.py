@@ -23,17 +23,27 @@ from __future__ import annotations
 
 import asyncio
 import random
+from typing import Optional
 
 import httpx
 import websockets
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from common.logging import get_logger
 from common.schemas import (
     HeartbeatMessage,
+    PeerReadyMessage,
     RobotRegisterRequest,
     RobotRegisterResponse,
+    SessionEndMessage,
+    SessionLiveMessage,
+    SessionStartMessage,
+    SignalingMessage,
 )
+from common.zmq_peer import ZmqPeer
+
+
+_signaling_decoder = TypeAdapter(SignalingMessage)
 
 
 # Reconnect backoff bounds. Random jitter is applied to prevent thundering-
@@ -70,7 +80,23 @@ class CloudClient:
         # heartbeats. Default is overwritten on successful register.
         self._heartbeat_interval_s: float = 2.0
 
+        # Per-session state: ZMQ peer and the current session_id, if any.
+        # Reset on session_end or WebSocket reconnect.
+        self._peer: Optional[ZmqPeer] = None
+        self._current_session_id: Optional[str] = None
+        # Reference to the active WebSocket so handlers can send peer_ready.
+        self._ws = None
+
         self._stop = asyncio.Event()
+
+    @property
+    def peer(self) -> Optional[ZmqPeer]:
+        """Exposed for tests and the data-flow wiring in step 7."""
+        return self._peer
+
+    @property
+    def current_session_id(self) -> Optional[str]:
+        return self._current_session_id
 
     # ----- public API --------------------------------------------------------
 
@@ -132,11 +158,12 @@ class CloudClient:
         Open the signaling WebSocket and send heartbeats until disconnected.
 
         Runs two concurrent tasks: a heartbeat sender and a receiver. The
-        receiver is mostly a sentinel — it reads inbound messages (today
-        none of interest; step 6 will dispatch session_start etc.) and
-        ensures we notice a closed socket promptly.
+        receiver dispatches inbound session_start / session_live / session_end
+        messages from the cloud — these drive the ZmqPeer bind/connect
+        lifecycle that establishes the data-plane triangle.
         """
         async with websockets.connect(ws_url) as ws:
+            self._ws = ws
             self._log.info(f"signaling WebSocket connected to {ws_url}")
             send_task = asyncio.create_task(
                 self._send_heartbeats(ws), name=f"{self.robot_id}-heartbeat-send"
@@ -145,20 +172,21 @@ class CloudClient:
                 self._receive_loop(ws), name=f"{self.robot_id}-heartbeat-recv"
             )
             try:
-                # Exit as soon as either task finishes; the other gets cancelled.
                 done, pending = await asyncio.wait(
                     [send_task, recv_task],
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 for task in pending:
                     task.cancel()
-                # Surface any exception from the completed task.
                 for task in done:
                     task.result()
             finally:
                 for task in (send_task, recv_task):
                     if not task.done():
                         task.cancel()
+                # Tear down any session state held across this connection.
+                await self._teardown_session("websocket closed")
+                self._ws = None
 
     async def _send_heartbeats(self, ws) -> None:
         """Send a HeartbeatMessage every heartbeat_interval_s until cancelled."""
@@ -171,15 +199,64 @@ class CloudClient:
             raise
 
     async def _receive_loop(self, ws) -> None:
-        """Read inbound messages. Step 6 will dispatch; today we log and drop."""
+        """Read inbound messages and dispatch on type."""
         async for raw in ws:
             try:
-                # Won't actually do anything useful in step 4 since the cloud
-                # doesn't send anything besides heartbeats. Once step 6 lands,
-                # this is where session_start / session_live get dispatched.
-                self._log.debug(f"received inbound signaling message: {raw!r}")
+                msg = _signaling_decoder.validate_json(raw)
             except ValidationError as exc:
                 self._log.warning(f"received malformed signaling message: {exc}")
+                continue
+
+            if isinstance(msg, SessionStartMessage):
+                await self._on_session_start(ws, msg)
+            elif isinstance(msg, SessionLiveMessage):
+                await self._on_session_live(msg)
+            elif isinstance(msg, SessionEndMessage):
+                self._log.info(f"session_end received: {msg.reason}")
+                await self._teardown_session(msg.reason)
+            else:
+                self._log.debug(f"ignoring inbound signaling message: {msg.type}")
+
+    async def _on_session_start(self, ws, msg: SessionStartMessage) -> None:
+        """Bind ZmqPeer and reply with peer_ready containing our endpoint."""
+        if self._peer is not None:
+            # Defensive: tear down any prior session before starting a new one.
+            await self._teardown_session("new session_start")
+        self._current_session_id = msg.session_id
+        self._peer = ZmqPeer(name=f"robot-{self.robot_id}")
+        endpoint = await self._peer.bind()
+        reply = PeerReadyMessage(
+            session_id=msg.session_id,
+            role="robot",
+            bind_endpoint=endpoint,
+        )
+        await ws.send(reply.model_dump_json())
+        self._log.info(
+            f"session {msg.session_id}: peer bound at {endpoint}; peer_ready sent"
+        )
+
+    async def _on_session_live(self, msg: SessionLiveMessage) -> None:
+        """Connect SUBs to player and user PUBs. Step 7 narrows subscriptions."""
+        if self._peer is None:
+            self._log.error("session_live received before session_start; refusing")
+            return
+        player_endpoint = msg.topology["player"]
+        user_endpoint = msg.topology["user"]
+        await self._peer.connect_to_peer(player_endpoint, subscribe_to=[""])
+        await self._peer.connect_to_peer(user_endpoint, subscribe_to=[""])
+        await self._peer.start()
+        self._log.info(
+            f"session {msg.session_id}: triangle live "
+            f"(player={player_endpoint}, user={user_endpoint})"
+        )
+
+    async def _teardown_session(self, reason: str) -> None:
+        """Close the ZmqPeer and clear session state. Idempotent."""
+        if self._peer is not None:
+            self._log.info(f"tearing down session ({reason})")
+            await self._peer.close()
+            self._peer = None
+        self._current_session_id = None
 
     def _backoff(self, attempt: int) -> float:
         """Exponential backoff with jitter, clamped to [MIN, MAX]."""

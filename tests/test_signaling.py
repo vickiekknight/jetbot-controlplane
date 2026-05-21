@@ -128,11 +128,11 @@ import asyncio
 async def test_connection_manager_attach_and_detach():
     mgr = ConnectionManager()
     fake_ws = object()  # opaque placeholder; close not called
-    await mgr.attach("robot-1", fake_ws)  # type: ignore[arg-type]
-    assert mgr.get("robot-1") is fake_ws
+    await mgr.attach_robot("robot-1", fake_ws)  # type: ignore[arg-type]
+    assert mgr.get_robot("robot-1") is fake_ws
     assert len(mgr) == 1
-    mgr.detach("robot-1")
-    assert mgr.get("robot-1") is None
+    mgr.detach_robot("robot-1")
+    assert mgr.get_robot("robot-1") is None
     assert len(mgr) == 0
 
 
@@ -150,10 +150,11 @@ async def test_connection_manager_replace_closes_prior():
     mgr = ConnectionManager()
     ws1 = FakeWS()
     ws2 = FakeWS()
-    await mgr.attach("robot-1", ws1)  # type: ignore[arg-type]
-    await mgr.attach("robot-1", ws2)  # type: ignore[arg-type]
+    await mgr.attach_robot("robot-1", ws1)  # type: ignore[arg-type]
+    await mgr.attach_robot("robot-1", ws2)  # type: ignore[arg-type]
     assert ws1.closed is True
-    assert mgr.get("robot-1") is ws2
+    assert mgr.get_robot("robot-1") is ws2
+
 
 @pytest.mark.asyncio
 async def test_connection_manager_user_sessions_are_independent_of_robots():
@@ -167,6 +168,7 @@ async def test_connection_manager_user_sessions_are_independent_of_robots():
     assert mgr.get_user("sess_abc") is user_ws
     assert mgr.get_robot("sess_abc") is None  # not cross-contaminated
     assert mgr.get_user("robot-1") is None
+
 
 # =============================================================================
 # Heartbeat eviction loop (logic-only test, no real WebSockets)

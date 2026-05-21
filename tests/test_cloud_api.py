@@ -18,6 +18,22 @@ from cloud_service.app import create_app
 def client() -> TestClient:
     """Fresh app + client per test. Isolated state."""
     app = create_app(public_url="http://localhost:8000")
+
+    # Stub the orchestrator's Player subprocess spawn so HTTP-only tests
+    # don't actually fork Python processes. The session reaches SPAWNING
+    # state but no real Player exists.
+    async def fake_spawn(session_id, robot_id, cloud_url):
+        class FakeProc:
+            pid = -1
+            returncode = 0  # already "exited"
+
+            def terminate(self): pass
+            def kill(self): pass
+            async def wait(self): return 0
+            stderr = None
+        return FakeProc()
+
+    app.state.orchestrator._spawn_player = fake_spawn  # type: ignore[method-assign]
     return TestClient(app)
 
 

@@ -61,6 +61,19 @@ class _LiveCloud:
         return f"http://localhost:{self.port}"
 
     def __enter__(self):
+        # Stub the orchestrator's spawn so CLI tests don't fork Python procs.
+        async def fake_spawn(session_id, robot_id, cloud_url):
+            class FakeProc:
+                pid = -1
+                returncode = 0
+                def terminate(self): pass
+                def kill(self): pass
+                async def wait(self): return 0
+                stderr = None
+            return FakeProc()
+
+        self.app.state.orchestrator._spawn_player = fake_spawn
+
         self._thread = threading.Thread(target=self._server.run, daemon=True)
         self._thread.start()
         # Wait until uvicorn signals it's accepting connections.

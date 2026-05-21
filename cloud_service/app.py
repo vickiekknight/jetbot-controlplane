@@ -38,7 +38,9 @@ import asyncio
 from cloud_service.registry import Registry
 from cloud_service.signaling import (
     ConnectionManager,
+    SessionOrchestrator,
     heartbeat_eviction_loop,
+    player_ws_handler,
     robot_ws_handler,
     user_ws_handler,
 )
@@ -102,6 +104,7 @@ def create_app(public_url: str = "http://localhost:8000") -> FastAPI:
                 await app.state.eviction_task
             except asyncio.CancelledError:
                 pass
+            await app.state.orchestrator.shutdown()
             _log.info("cloud service stopped")
 
     app = FastAPI(
@@ -111,11 +114,12 @@ def create_app(public_url: str = "http://localhost:8000") -> FastAPI:
         lifespan=lifespan,
     )
 
-    # State: one Registry + one ConnectionManager per app instance, both
-    # attached to app.state for access via dependencies. Tests can swap
-    # either by overriding the corresponding dependency.
+    # State: one Registry + one ConnectionManager + one SessionOrchestrator
+    # per app instance, all attached to app.state. Tests can swap any by
+    # overriding the corresponding dependency or reaching into app.state.
     app.state.registry = Registry()
     app.state.connections = ConnectionManager()
+    app.state.orchestrator = SessionOrchestrator(app.state.connections)
     app.state.public_url = public_url
 
     # ----- POST /robots/register -----------------------------------------
@@ -158,6 +162,7 @@ def create_app(public_url: str = "http://localhost:8000") -> FastAPI:
         responses={
             404: {"description": "Robot not found in registry"},
             409: {"description": "Robot exists but is not online"},
+            500: {"description": "Player subprocess failed to spawn"},
         },
     )
     async def create_session(
@@ -179,20 +184,32 @@ def create_app(public_url: str = "http://localhost:8000") -> FastAPI:
                 ),
             )
 
-        # Session IDs are random hex strings prefixed for readability in logs.
-        # NOT a security boundary — these aren't auth tokens. They're a handle
-        # the user will use when opening its signaling WebSocket. The actual
-        # session-state lifecycle starts when signaling happens (step 6); for
-        # now we just generate the ID and tell the user where to connect.
-        session_id = f"sess_{secrets.token_hex(6)}"
+        # Hand off to the orchestrator: allocates session_id, spawns Player,
+        # returns the Session in SPAWNING state. The rest of the handshake
+        # is driven asynchronously by WebSocket events.
+        try:
+            session = await app.state.orchestrator.start_session(
+                robot_id=req.robot_id,
+                user_id=req.user_id,
+                cloud_url_for_subprocess=app.state.public_url,
+            )
+        except Exception as exc:
+            _log.exception("session start failed")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to start session: {exc!r}",
+            )
+
         _log.info(
-            f"session {session_id} requested by user={req.user_id!r} "
+            f"session {session.session_id} requested by user={req.user_id!r} "
             f"for robot={req.robot_id!r}"
         )
         return SessionResponse(
-            session_id=session_id,
+            session_id=session.session_id,
             robot_id=req.robot_id,
-            websocket_url=_ws_url(app.state.public_url, f"/ws/user/{session_id}"),
+            websocket_url=_ws_url(
+                app.state.public_url, f"/ws/user/{session.session_id}"
+            ),
         )
 
     # ----- WebSocket: /ws/robot/{robot_id} -------------------------------
@@ -206,19 +223,29 @@ def create_app(public_url: str = "http://localhost:8000") -> FastAPI:
             robot_id=robot_id,
             registry=app.state.registry,
             connections=app.state.connections,
+            orchestrator=app.state.orchestrator,
         )
 
     # ----- WebSocket: /ws/user/{session_id} ------------------------------
-    # The user's signaling channel. In step 5 (now) the connection is
-    # accepted but the cloud doesn't send anything on it; step 6 fills in
-    # the session_start / session_live dispatch logic.
-
     @app.websocket("/ws/user/{session_id}")
     async def user_signaling(ws: WebSocket, session_id: str):
         await user_ws_handler(
             ws=ws,
             session_id=session_id,
             connections=app.state.connections,
+            orchestrator=app.state.orchestrator,
+        )
+
+    # ----- WebSocket: /ws/player/{session_id} ----------------------------
+    # The Player subprocess opens this WebSocket after spawn. Its arrival
+    # triggers the cloud's session_start broadcast (see SessionOrchestrator).
+    @app.websocket("/ws/player/{session_id}")
+    async def player_signaling(ws: WebSocket, session_id: str):
+        await player_ws_handler(
+            ws=ws,
+            session_id=session_id,
+            connections=app.state.connections,
+            orchestrator=app.state.orchestrator,
         )
 
     return app

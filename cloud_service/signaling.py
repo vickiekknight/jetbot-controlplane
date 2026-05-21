@@ -38,6 +38,8 @@ via touch_heartbeat (see Registry).
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 import time
 from typing import Optional
 
@@ -45,8 +47,21 @@ from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import TypeAdapter, ValidationError
 
 from cloud_service.registry import Registry
+from cloud_service.session_manager import (
+    InvalidTransition,
+    Session,
+    SessionManager,
+    SessionState,
+)
 from common.logging import get_logger
-from common.schemas import HeartbeatMessage, SignalingMessage
+from common.schemas import (
+    HeartbeatMessage,
+    PeerReadyMessage,
+    SessionEndMessage,
+    SessionLiveMessage,
+    SessionStartMessage,
+    SignalingMessage,
+)
 
 
 _log = get_logger("signaling")
@@ -85,6 +100,9 @@ class ConnectionManager:
     def __init__(self):
         self._robots: dict[str, WebSocket] = {}
         self._users: dict[str, WebSocket] = {}
+        # Player WebSockets are keyed by session_id, like users — one Player
+        # per session.
+        self._players: dict[str, WebSocket] = {}
 
     async def attach_robot(self, robot_id: str, ws: WebSocket) -> None:
         """Register a WebSocket as the active connection for a robot."""
@@ -124,8 +142,27 @@ class ConnectionManager:
     def get_user(self, session_id: str) -> Optional[WebSocket]:
         return self._users.get(session_id)
 
+    async def attach_player(self, session_id: str, ws: WebSocket) -> None:
+        """Register a WebSocket as the active connection for a player session."""
+        prior = self._players.get(session_id)
+        if prior is not None:
+            _log.warning(
+                f"player session {session_id!r} reconnected; closing prior WebSocket"
+            )
+            try:
+                await prior.close(code=1001, reason="Replaced by new connection")
+            except Exception:
+                pass
+        self._players[session_id] = ws
+
+    def detach_player(self, session_id: str) -> None:
+        self._players.pop(session_id, None)
+
+    def get_player(self, session_id: str) -> Optional[WebSocket]:
+        return self._players.get(session_id)
+
     def __len__(self) -> int:
-        return len(self._robots) + len(self._users)
+        return len(self._robots) + len(self._users) + len(self._players)
 
 
 # Backwards-compatible aliases so the existing robot_ws_handler keeps working
@@ -147,21 +184,17 @@ async def robot_ws_handler(
     robot_id: str,
     registry: Registry,
     connections: ConnectionManager,
+    orchestrator: Optional["SessionOrchestrator"] = None,
 ) -> None:
     """
     Per-robot WebSocket handler.
 
-    Lifecycle:
-      1. Accept the connection.
-      2. Verify the robot is registered (reject otherwise — robots must
-         POST /robots/register before opening their WebSocket).
-      3. Register the WebSocket in the ConnectionManager.
-      4. Loop: receive JSON messages, decode as SignalingMessage, dispatch.
-         For step 4, only heartbeat is meaningful; other types are logged
-         and ignored until step 6 implements them.
-      5. On disconnect or error: detach from ConnectionManager and mark
-         the robot offline (the next register call will bring it back
-         online).
+    Handles two message kinds in step 6:
+      - HeartbeatMessage: updates registry's last_heartbeat_ts (step 4).
+      - PeerReadyMessage: forwarded to the orchestrator (step 6).
+
+    Other signaling messages from the robot are still logged and dropped —
+    robots aren't expected to send session_start, session_live, etc.
     """
     await ws.accept()
 
@@ -188,12 +221,11 @@ async def robot_ws_handler(
 
             if isinstance(msg, HeartbeatMessage):
                 registry.touch_heartbeat(robot_id)
+            elif isinstance(msg, PeerReadyMessage) and orchestrator is not None:
+                await orchestrator.handle_peer_ready(msg)
             else:
-                # Step 6 will handle peer_ready and other variants. For now,
-                # log and drop.
                 _log.debug(
-                    f"robot {robot_id!r} sent {msg.type!r} "
-                    f"(not yet handled in step 4)"
+                    f"robot {robot_id!r} sent {msg.type!r} (not handled)"
                 )
 
     except WebSocketDisconnect:
@@ -202,7 +234,6 @@ async def robot_ws_handler(
         _log.exception(f"robot {robot_id!r} signaling WebSocket error")
     finally:
         connections.detach_robot(robot_id)
-        # We mark offline rather than removing entirely; see module docstring.
         registry.mark_offline(robot_id)
 
 
@@ -210,24 +241,14 @@ async def user_ws_handler(
     ws: WebSocket,
     session_id: str,
     connections: ConnectionManager,
+    orchestrator: Optional["SessionOrchestrator"] = None,
 ) -> None:
     """
     Per-user-session WebSocket handler.
 
-    In step 5 (this step), the handler just accepts the connection, attaches
-    it to the ConnectionManager, and parks. The cloud doesn't send anything
-    on this channel yet — that work is step 6's session signaling.
-
-    Why open it at all today? Two reasons:
-      1. End-to-end testability: the `user connect` command can be exercised
-         against a real cloud, and we verify it reaches the right endpoint.
-      2. Slot for step 6: when session signaling lands, every piece (URL,
-         routing, lifecycle) is already wired; only the message-handler
-         logic needs to be added.
-
-    Note: session validation (does this session_id correspond to a real
-    pending session?) is deferred to step 6 along with the rest of the
-    session lifecycle.
+    Dispatches peer_ready messages to the orchestrator. session_start /
+    session_live are pushed *to* the user by the orchestrator (not handled
+    here, since users don't send them inbound).
     """
     await ws.accept()
     await connections.attach_user(session_id, ws)
@@ -236,15 +257,70 @@ async def user_ws_handler(
     try:
         while True:
             raw = await ws.receive_text()
-            # User-initiated signaling messages (peer_ready) arrive in step 6.
-            # Today we log and drop anything inbound.
-            _log.debug(f"user {session_id!r} sent inbound message: {raw!r}")
+            try:
+                msg = _signaling_decoder.validate_json(raw)
+            except ValidationError as exc:
+                _log.warning(
+                    f"user {session_id!r} sent malformed signaling message: {exc}"
+                )
+                continue
+            if isinstance(msg, PeerReadyMessage) and orchestrator is not None:
+                await orchestrator.handle_peer_ready(msg)
+            else:
+                _log.debug(f"user {session_id!r} sent {msg.type!r} (not handled)")
     except WebSocketDisconnect:
         _log.info(f"user session {session_id!r} signaling WebSocket disconnected")
     except Exception:
         _log.exception(f"user session {session_id!r} signaling WebSocket error")
     finally:
         connections.detach_user(session_id)
+        # User disconnect ends the session for everyone.
+        if orchestrator is not None:
+            await orchestrator.end_session(session_id, "user disconnected")
+
+
+async def player_ws_handler(
+    ws: WebSocket,
+    session_id: str,
+    connections: ConnectionManager,
+    orchestrator: "SessionOrchestrator",
+) -> None:
+    """
+    Per-player-session WebSocket handler.
+
+    When a Player attaches, the orchestrator transitions the session from
+    SPAWNING to AWAITING_PEERS and broadcasts session_start to the triangle.
+    From there, the Player binds its ZMQ peer and sends peer_ready back.
+    """
+    await ws.accept()
+    await connections.attach_player(session_id, ws)
+    _log.info(f"player session {session_id!r} signaling WebSocket connected")
+
+    # Player attachment is the trigger for sending session_start to the triangle.
+    await orchestrator.handle_player_attached(session_id)
+
+    try:
+        while True:
+            raw = await ws.receive_text()
+            try:
+                msg = _signaling_decoder.validate_json(raw)
+            except ValidationError as exc:
+                _log.warning(
+                    f"player {session_id!r} sent malformed signaling message: {exc}"
+                )
+                continue
+            if isinstance(msg, PeerReadyMessage):
+                await orchestrator.handle_peer_ready(msg)
+            else:
+                _log.debug(f"player {session_id!r} sent {msg.type!r} (not handled)")
+    except WebSocketDisconnect:
+        _log.info(f"player session {session_id!r} signaling WebSocket disconnected")
+    except Exception:
+        _log.exception(f"player session {session_id!r} signaling WebSocket error")
+    finally:
+        connections.detach_player(session_id)
+        # If the player drops mid-session, the session is dead.
+        await orchestrator.end_session(session_id, "player disconnected")
 
 
 async def heartbeat_eviction_loop(
@@ -290,3 +366,294 @@ async def heartbeat_eviction_loop(
         except Exception:
             # Never let the sweep loop die — log and continue.
             _log.exception("heartbeat eviction loop error (continuing)")
+
+
+# =============================================================================
+# Session orchestration: spawn Player, drive the three-phase handshake
+# =============================================================================
+#
+# The orchestrator wraps:
+#   - SessionManager (state)
+#   - ConnectionManager (WebSocket lookup)
+#   - subprocess spawning (Player lifecycle)
+#
+# Flow (happy path):
+#   1. start_session(robot_id, user_id):
+#        - SessionManager.create() allocates a session
+#        - Player subprocess is spawned
+#        - state → SPAWNING
+#   2. when Player attaches its WebSocket:
+#        - state → AWAITING_PEERS
+#        - cloud sends session_start to robot and user (Player's start is
+#          implicit — it just attached)
+#   3. as each peer_ready arrives via signaling WebSocket:
+#        - endpoints[role] = endpoint
+#        - when all three present: state → LIVE, cloud broadcasts
+#          session_live with full topology
+#   4. on any disconnect or end_session():
+#        - state → ENDED, session_end broadcast, Player killed
+
+
+class SessionOrchestrator:
+    """
+    Glue between SessionManager, ConnectionManager, and Player subprocesses.
+
+    One instance per app. Owns the SessionManager (so the FastAPI route
+    handlers can access it via app.state). The signaling WebSocket
+    handlers call into this object to react to incoming messages.
+    """
+
+    def __init__(self, connections: ConnectionManager):
+        self.sessions = SessionManager()
+        self._connections = connections
+        # session_id → subprocess.Popen-like object
+        self._player_procs: dict[str, asyncio.subprocess.Process] = {}
+
+    # ----- public API used by HTTP/WebSocket handlers -----------------------
+
+    async def start_session(
+        self,
+        robot_id: str,
+        user_id: str,
+        cloud_url_for_subprocess: str,
+    ) -> Session:
+        """
+        Allocate a session, spawn the Player subprocess.
+
+        Returns the Session in SPAWNING state. The caller (POST /sessions)
+        responds to the user immediately; the rest of the handshake
+        happens asynchronously over WebSockets.
+        """
+        session = self.sessions.create(robot_id=robot_id, user_id=user_id)
+        session.mark_spawning()
+
+        try:
+            proc = await self._spawn_player(
+                session_id=session.session_id,
+                robot_id=robot_id,
+                cloud_url=cloud_url_for_subprocess,
+            )
+        except Exception as exc:
+            self.sessions.end(session.session_id, f"player spawn failed: {exc!r}")
+            raise
+
+        self._player_procs[session.session_id] = proc
+        session.player_pid = proc.pid
+        return session
+
+    async def handle_player_attached(self, session_id: str) -> None:
+        """
+        Called from user_ws_handler / player_ws_handler when the Player's
+        signaling WebSocket attaches. Transitions to AWAITING_PEERS and
+        sends session_start to robot and user.
+
+        Note: the Player's own session_start is implicit — by opening its
+        WebSocket it has effectively acknowledged "I am here, ready to bind."
+        """
+        session = self.sessions.get(session_id)
+        if session is None:
+            _log.warning(f"player_attached for unknown session {session_id}")
+            return
+        if session.state != SessionState.SPAWNING:
+            # Already past spawning (e.g. duplicate attach). Idempotent.
+            return
+
+        session.mark_awaiting_peers()
+
+        # Dispatch session_start to robot and user. Player binds without
+        # needing a message because it knows it just spawned.
+        await self._send_to_robot(session.robot_id, SessionStartMessage(
+            session_id=session.session_id,
+            robot_id=session.robot_id,
+        ))
+        await self._send_to_user(session.session_id, SessionStartMessage(
+            session_id=session.session_id,
+            robot_id=session.robot_id,
+        ))
+        await self._send_to_player(session.session_id, SessionStartMessage(
+            session_id=session.session_id,
+            robot_id=session.robot_id,
+        ))
+
+    async def handle_peer_ready(self, message: PeerReadyMessage) -> None:
+        """
+        Called when any peer (robot, user, player) sends peer_ready.
+        If this completes the triangle, transition to LIVE and broadcast
+        session_live.
+        """
+        session = self.sessions.get(message.session_id)
+        if session is None:
+            _log.warning(
+                f"peer_ready for unknown session {message.session_id}; ignoring"
+            )
+            return
+
+        try:
+            complete = session.record_peer_ready(message.role, message.bind_endpoint)
+        except InvalidTransition as exc:
+            _log.warning(
+                f"peer_ready rejected for session {message.session_id}: {exc}"
+            )
+            return
+
+        if complete:
+            session.mark_live()
+            await self._broadcast_session_live(session)
+            self.sessions.signal_live(session.session_id)
+
+    async def end_session(self, session_id: str, reason: str) -> None:
+        """
+        End a session: broadcast session_end, kill Player, mark ENDED.
+        Idempotent.
+        """
+        session = self.sessions.get(session_id)
+        if session is None or session.state == SessionState.ENDED:
+            return
+
+        # Broadcast before we tear anything down, so peers get notification.
+        end_msg = SessionEndMessage(session_id=session_id, reason=reason)
+        for role, sender in (
+            ("robot", lambda: self._send_to_robot(session.robot_id, end_msg)),
+            ("user", lambda: self._send_to_user(session_id, end_msg)),
+            ("player", lambda: self._send_to_player(session_id, end_msg)),
+        ):
+            try:
+                await sender()
+            except Exception:
+                _log.exception(f"failed to send session_end to {role}")
+
+        self.sessions.end(session_id, reason)
+        await self._terminate_player(session_id)
+
+    async def shutdown(self) -> None:
+        """Kill all live Player subprocesses. Called on cloud shutdown."""
+        for session_id in list(self._player_procs.keys()):
+            await self._terminate_player(session_id)
+
+    # ----- subprocess management --------------------------------------------
+
+    async def _spawn_player(
+        self,
+        session_id: str,
+        robot_id: str,
+        cloud_url: str,
+    ) -> asyncio.subprocess.Process:
+        """
+        Launch the Player as a separate Python process.
+
+        We use `python -m player ...` (not `python player/__main__.py`) so
+        the module is resolved via PYTHONPATH the same way it is in the
+        cloud — no relative-path fragility.
+        """
+        cmd = [
+            sys.executable, "-m", "player",
+            "--session-id", session_id,
+            "--robot-id", robot_id,
+            "--cloud-url", cloud_url,
+        ]
+        _log.info(f"spawning player: {' '.join(cmd)}")
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            # Inherit PYTHONPATH from cloud's environment so subprocess can
+            # find common/, robot/, etc. without us setting it explicitly.
+            env={**os.environ},
+        )
+        # Spawn a logging task that streams the player's stderr to our log.
+        # Without this, player errors are silent and very confusing to debug.
+        asyncio.create_task(
+            self._stream_subprocess_output(session_id, proc),
+            name=f"player-output-{session_id}",
+        )
+        return proc
+
+    async def _stream_subprocess_output(
+        self,
+        session_id: str,
+        proc: asyncio.subprocess.Process,
+    ) -> None:
+        """Read player's stderr and re-log it with a session_id prefix."""
+        if proc.stderr is None:
+            return
+        try:
+            async for line in proc.stderr:
+                _log.info(
+                    f"[player {session_id}] {line.decode(errors='replace').rstrip()}"
+                )
+        except Exception:
+            _log.exception(f"player output stream failed for {session_id}")
+
+    async def _terminate_player(self, session_id: str) -> None:
+        """Terminate the Player subprocess for a session. Idempotent."""
+        proc = self._player_procs.pop(session_id, None)
+        if proc is None:
+            return
+        if proc.returncode is not None:
+            return  # already exited
+        try:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                _log.warning(
+                    f"player for session {session_id} did not exit; killing"
+                )
+                proc.kill()
+                await proc.wait()
+        except ProcessLookupError:
+            pass
+
+    # ----- WebSocket send helpers -------------------------------------------
+
+    async def _send_to_robot(self, robot_id: str, msg) -> None:
+        ws = self._connections.get_robot(robot_id)
+        if ws is None:
+            _log.warning(f"no WebSocket for robot {robot_id}; cannot send {msg.type}")
+            return
+        try:
+            await ws.send_text(msg.model_dump_json())
+        except Exception:
+            _log.exception(f"failed to send {msg.type} to robot {robot_id}")
+
+    async def _send_to_user(self, session_id: str, msg) -> None:
+        ws = self._connections.get_user(session_id)
+        if ws is None:
+            _log.warning(
+                f"no WebSocket for user session {session_id}; cannot send {msg.type}"
+            )
+            return
+        try:
+            await ws.send_text(msg.model_dump_json())
+        except Exception:
+            _log.exception(f"failed to send {msg.type} to user {session_id}")
+
+    async def _send_to_player(self, session_id: str, msg) -> None:
+        ws = self._connections.get_player(session_id)
+        if ws is None:
+            _log.warning(
+                f"no WebSocket for player session {session_id}; cannot send {msg.type}"
+            )
+            return
+        try:
+            await ws.send_text(msg.model_dump_json())
+        except Exception:
+            _log.exception(f"failed to send {msg.type} to player {session_id}")
+
+    async def _broadcast_session_live(self, session: Session) -> None:
+        """
+        Send session_live (with the full topology) to all three peers.
+        """
+        msg = SessionLiveMessage(
+            session_id=session.session_id,
+            robot_id=session.robot_id,
+            topology={
+                "robot": session.endpoints["robot"],
+                "user": session.endpoints["user"],
+                "player": session.endpoints["player"],
+            },
+        )
+        await self._send_to_robot(session.robot_id, msg)
+        await self._send_to_user(session.session_id, msg)
+        await self._send_to_player(session.session_id, msg)
