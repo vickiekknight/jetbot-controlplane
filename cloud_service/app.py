@@ -28,11 +28,19 @@ and clear from the function signature what each handler needs.
 
 from __future__ import annotations
 
+import os
 import secrets
+from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, status
+import asyncio
 
 from cloud_service.registry import Registry
+from cloud_service.signaling import (
+    ConnectionManager,
+    heartbeat_eviction_loop,
+    robot_ws_handler,
+)
 from common.logging import configure_logging, get_logger
 from common.schemas import (
     RobotListResponse,
@@ -75,16 +83,38 @@ def create_app(public_url: str = "http://localhost:8000") -> FastAPI:
                     to robots and users. Defaults to localhost:8000 for
                     single-host development.
     """
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # Start the heartbeat eviction sweep loop as a background task.
+        # Stored on app.state so tests can introspect/cancel it directly.
+        app.state.eviction_task = asyncio.create_task(
+            heartbeat_eviction_loop(app.state.registry, app.state.connections),
+            name="heartbeat-eviction",
+        )
+        _log.info("cloud service started")
+        try:
+            yield
+        finally:
+            app.state.eviction_task.cancel()
+            try:
+                await app.state.eviction_task
+            except asyncio.CancelledError:
+                pass
+            _log.info("cloud service stopped")
+
     app = FastAPI(
         title="JetBot Control Plane",
         description="Cloud orchestrator for the robot/user/player triangle.",
         version="0.1.0",
+        lifespan=lifespan,
     )
 
-    # State: one Registry per app instance, attached to app.state for access
-    # via the _get_registry dependency. Tests can override via
-    # app.dependency_overrides[_get_registry] = lambda: my_registry.
+    # State: one Registry + one ConnectionManager per app instance, both
+    # attached to app.state for access via dependencies. Tests can swap
+    # either by overriding the corresponding dependency.
     app.state.registry = Registry()
+    app.state.connections = ConnectionManager()
     app.state.public_url = public_url
 
     # ----- POST /robots/register -----------------------------------------
@@ -162,6 +192,19 @@ def create_app(public_url: str = "http://localhost:8000") -> FastAPI:
             session_id=session_id,
             robot_id=req.robot_id,
             websocket_url=_ws_url(app.state.public_url, f"/ws/user/{session_id}"),
+        )
+
+    # ----- WebSocket: /ws/robot/{robot_id} -------------------------------
+    # The robot's signaling channel. Heartbeats today; session signaling
+    # in step 6. See cloud_service/signaling.py for the protocol.
+
+    @app.websocket("/ws/robot/{robot_id}")
+    async def robot_signaling(ws: WebSocket, robot_id: str):
+        await robot_ws_handler(
+            ws=ws,
+            robot_id=robot_id,
+            registry=app.state.registry,
+            connections=app.state.connections,
         )
 
     return app

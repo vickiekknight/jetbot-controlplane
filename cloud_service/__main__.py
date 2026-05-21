@@ -64,7 +64,15 @@ def main() -> None:
         public_url = args.public_url
 
     app = create_app(public_url=public_url)
-    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level.lower())
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level=args.log_level.lower(),
+        # wsproto avoids deprecation warnings from uvicorn's `websockets`
+        # backend when running against websockets >= 14.0.
+        ws="wsproto",
+    )
 
 
 if __name__ == "__main__":
