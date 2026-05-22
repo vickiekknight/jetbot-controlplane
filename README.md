@@ -1,6 +1,7 @@
 # JetBot Control Plane
 
 A small distributed system that orchestrates a triangle of pub/sub peers — robot, user, and per-session inference worker ("player") — connected through a thin cloud orchestrator.
+**For the architectural rationale, alternatives considered, and trade-off discussion, see DESIGN.md.**
 
 ## Quickstart
 
