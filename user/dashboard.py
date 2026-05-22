@@ -1,8 +1,8 @@
 """
 Live terminal dashboard for the user CLI.
- 
+
 Renders four panels with Rich:
- 
+
   ┌─ Session ────────────────────────────────────────┐
   │ robot-1 (sess_abc123)   user=test   state=live   │
   └──────────────────────────────────────────────────┘
@@ -20,7 +20,7 @@ Renders four panels with Rich:
   │ forward | backward | left | right | stop | quit  │
   │ >>> sent: forward                                │
   └──────────────────────────────────────────────────┘
- 
+
 Dashboard is the view layer. The CLI updates it by calling update_*
 methods, which trigger an immediate redraw. The trail uses a fixed-size
 character grid that auto-rescales to keep both the origin and the
@@ -47,12 +47,13 @@ TRAIL_WIDTH = 60
 TRAIL_HEIGHT = 8
 TRAIL_HISTORY = 100  # number of recent poses to remember
 
-# World extent the trail represents, in meters. The robot's pose is mapped
-# from world coords to grid cells using this bounding box.
-TRAIL_WORLD_MIN_X = -3.0
-TRAIL_WORLD_MAX_X = 3.0
-TRAIL_WORLD_MIN_Y = -1.5
-TRAIL_WORLD_MAX_Y = 1.5
+# Minimum visible extent of the trail's coordinate window, in meters. The
+# window always shows at least this much of the world; it auto-expands
+# when the robot moves further. The asymmetric defaults (wider X than Y)
+# reflect the terminal grid's aspect ratio (60 cols × 8 rows).
+TRAIL_MIN_HALF_WIDTH_X = 1.0   # ±1m visible by default
+TRAIL_MIN_HALF_WIDTH_Y = 0.25  # ±0.25m visible by default
+TRAIL_PADDING_FACTOR = 1.2     # 20% padding around the extreme positions
 
 
 @dataclass
@@ -215,8 +216,13 @@ class Dashboard:
         # Status row
         if self.state.last_status is not None:
             st = self.state.last_status
+            level = st.get("level", "info")
+            level_color = {"info": "cyan", "warn": "yellow", "error": "red"}.get(
+                level, "white"
+            )
             status_text = (
-                f"[dim]{st.get('source', '?')}[/dim]: {st.get('message', '')}"
+                f"[dim]{st.get('source', '?')}[/dim]: "
+                f"[{level_color}]{st.get('message', '')}[/{level_color}]"
             )
         else:
             status_text = "[dim]none[/dim]"
@@ -225,53 +231,74 @@ class Dashboard:
         return Panel(table, title="Telemetry", border_style="cyan")
 
     def _trail_panel(self) -> Panel:
-        """ASCII visualization of recent robot positions."""
-        # Build a grid filled with dots, then overlay positions.
+        """ASCII visualization of recent robot positions.
+
+        Coordinate window auto-rescales: bounds are computed from the
+        trail plus the origin (0, 0), with a small padding factor and a
+        minimum extent. This keeps both the magenta '+' origin and the
+        green current-position glyph in frame even as the robot moves
+        far from the start.
+        """
+        # Collect all points we want visible: every trail entry + origin.
+        xs = [0.0] + [p[0] for p in self.state.trail]
+        ys = [0.0] + [p[1] for p in self.state.trail]
+        cx = (max(xs) + min(xs)) / 2.0
+        cy = (max(ys) + min(ys)) / 2.0
+        half_x = max(TRAIL_MIN_HALF_WIDTH_X,
+                     (max(xs) - min(xs)) / 2.0 * TRAIL_PADDING_FACTOR)
+        half_y = max(TRAIL_MIN_HALF_WIDTH_Y,
+                     (max(ys) - min(ys)) / 2.0 * TRAIL_PADDING_FACTOR)
+        min_x, max_x = cx - half_x, cx + half_x
+        min_y, max_y = cy - half_y, cy + half_y
+
+        def to_grid_x(x: float) -> int:
+            return int((x - min_x) / (max_x - min_x) * (TRAIL_WIDTH - 1))
+
+        def to_grid_y(y: float) -> int:
+            # Invert so positive y is "up" on the terminal.
+            return TRAIL_HEIGHT - 1 - int(
+                (y - min_y) / (max_y - min_y) * (TRAIL_HEIGHT - 1)
+            )
+
         grid = [["·"] * TRAIL_WIDTH for _ in range(TRAIL_HEIGHT)]
 
-        # Mark world origin with a '+'.
-        ox = _world_to_grid_x(0.0)
-        oy = _world_to_grid_y(0.0)
+        # Origin marker.
+        ox, oy = to_grid_x(0.0), to_grid_y(0.0)
         if 0 <= ox < TRAIL_WIDTH and 0 <= oy < TRAIL_HEIGHT:
             grid[oy][ox] = "+"
 
-        # Older trail points first, so the newest overwrites the oldest if
-        # they collide. The newest one gets a brighter glyph.
+        # Trail points. Older first so the newest can overwrite collisions.
         for i, (x, y, theta) in enumerate(self.state.trail):
-            gx = _world_to_grid_x(x)
-            gy = _world_to_grid_y(y)
-            if 0 <= gx < TRAIL_WIDTH and 0 <= gy < TRAIL_HEIGHT:
-                is_newest = (i == len(self.state.trail) - 1)
-                if is_newest:
-                    # Use a directional glyph based on heading.
-                    grid[gy][gx] = _heading_glyph(theta)
-                else:
-                    grid[gy][gx] = "·" if grid[gy][gx] == "·" else "·"
-                    grid[gy][gx] = "o"
+            gx, gy = to_grid_x(x), to_grid_y(y)
+            if not (0 <= gx < TRAIL_WIDTH and 0 <= gy < TRAIL_HEIGHT):
+                continue
+            is_newest = (i == len(self.state.trail) - 1)
+            grid[gy][gx] = _heading_glyph(theta) if is_newest else "o"
 
-        # Compose into a Text with the newest point highlighted.
-        lines = ["".join(row) for row in grid]
-        body = Text("\n".join(lines), style="dim")
-        # Re-highlight the newest position if any.
+        # Compose into a styled Text. The newest position is bold green,
+        # the origin is magenta, the rest of the trail is cyan.
+        newest_gx, newest_gy = -1, -1
         if self.state.trail:
-            newest_x, newest_y, theta = self.state.trail[-1]
-            gx = _world_to_grid_x(newest_x)
-            gy = _world_to_grid_y(newest_y)
-            if 0 <= gx < TRAIL_WIDTH and 0 <= gy < TRAIL_HEIGHT:
-                # Build a styled text manually so we can color the newest cell.
-                body = Text()
-                for ri, row in enumerate(grid):
-                    for ci, ch in enumerate(row):
-                        if ri == gy and ci == gx:
-                            body.append(ch, style="bold green")
-                        elif ch == "o":
-                            body.append(ch, style="cyan")
-                        elif ch == "+":
-                            body.append(ch, style="magenta")
-                        else:
-                            body.append(ch, style="dim")
-                    body.append("\n")
-        return Panel(body, title="Trail (newest in green, origin in magenta)", border_style="cyan")
+            nx, ny, _ = self.state.trail[-1]
+            newest_gx, newest_gy = to_grid_x(nx), to_grid_y(ny)
+
+        body = Text()
+        for ri, row in enumerate(grid):
+            for ci, ch in enumerate(row):
+                if ri == newest_gy and ci == newest_gx:
+                    body.append(ch, style="bold green")
+                elif ch == "o":
+                    body.append(ch, style="cyan")
+                elif ch == "+":
+                    body.append(ch, style="magenta")
+                else:
+                    body.append(ch, style="dim")
+            body.append("\n")
+        return Panel(
+            body,
+            title="Trail (newest in green, origin in magenta)",
+            border_style="cyan",
+        )
 
     def _prompt_panel(self) -> Panel:
         commands = "[dim]forward | backward | left | right | stop | quit[/dim]"
@@ -282,19 +309,6 @@ class Dashboard:
             f"[cyan]>>>[/cyan] {self.state.input_buffer}"
         )
         return Panel(prompt, title="Command", border_style="green")
-
-
-def _world_to_grid_x(x: float) -> int:
-    """Map world-x to grid-x. Origin in middle of grid."""
-    frac = (x - TRAIL_WORLD_MIN_X) / (TRAIL_WORLD_MAX_X - TRAIL_WORLD_MIN_X)
-    return int(frac * TRAIL_WIDTH)
-
-
-def _world_to_grid_y(y: float) -> int:
-    """Map world-y to grid-y. Y axis inverted because terminals draw top-down."""
-    frac = (y - TRAIL_WORLD_MIN_Y) / (TRAIL_WORLD_MAX_Y - TRAIL_WORLD_MIN_Y)
-    # Invert so positive y is "up" on screen.
-    return TRAIL_HEIGHT - 1 - int(frac * TRAIL_HEIGHT)
 
 
 def _heading_glyph(theta: float) -> str:

@@ -1,13 +1,13 @@
 """
 The robot's network client.
- 
+
 Three responsibilities:
   1. Register with the cloud over HTTP on startup.
   2. Maintain a long-lived signaling WebSocket: send heartbeats, receive
      session_start / session_live / session_end.
   3. Manage the data-plane ZmqPeer for the active session — bind on
      session_start, connect SUBs on session_live, tear down on session_end.
- 
+
 On WebSocket disconnect the client reconnects with jittered exponential
 backoff (1s, 2s, 4s, capped at 30s). Each reconnect retries the full
 register + WebSocket flow, since the cloud may have evicted the robot
@@ -109,7 +109,7 @@ class CloudClient:
 
     @property
     def peer(self) -> Optional[ZmqPeer]:
-        """Exposed for tests and the data-flow wiring in step 7."""
+        """Exposed for the data-flow wiring (sensor publish loop)."""
         return self._peer
 
     @property
@@ -295,6 +295,24 @@ class CloudClient:
             f"(player={player_endpoint}, user={user_endpoint})"
         )
 
+        # Announce ourselves on the status topic. This is the spec's
+        # "any entity may publish to status" channel; we use it for
+        # lifecycle events (online here, offline at teardown, error on
+        # command failure).
+        #
+        # A brief delay gives the other peers' SUB sockets time to
+        # finish their subscription handshake before this one-shot event
+        # is published. Without it, status would race the slow-joiner
+        # window and be dropped intermittently. (The sensor stream
+        # doesn't have this problem because it republishes every second.)
+        driver_name = type(self._driver).__name__ if self._driver else "none"
+        await asyncio.sleep(0.2)
+        await self._peer.publish(status_topic, {
+            "source": "robot",
+            "level": "info",
+            "message": f"online ({driver_name})",
+        })
+
         # Kick off the sensor publish loop. It runs until the peer is torn down.
         self._sensor_task = asyncio.create_task(
             self._sensor_publish_loop(rid),
@@ -325,16 +343,32 @@ class CloudClient:
 
         # The driver methods are sync (matches jetbot's API); they don't
         # block long enough to need to be offloaded.
-        if cmd == "forward":
-            self._driver.forward(speed)
-        elif cmd == "backward":
-            self._driver.backward(speed)
-        elif cmd == "left":
-            self._driver.left(speed)
-        elif cmd == "right":
-            self._driver.right(speed)
-        elif cmd == "stop":
-            self._driver.stop()
+        try:
+            if cmd == "forward":
+                self._driver.forward(speed)
+            elif cmd == "backward":
+                self._driver.backward(speed)
+            elif cmd == "left":
+                self._driver.left(speed)
+            elif cmd == "right":
+                self._driver.right(speed)
+            elif cmd == "stop":
+                self._driver.stop()
+        except Exception as exc:
+            # Publish on the status topic so the user dashboard sees the error.
+            self._log.exception(f"driver raised executing {cmd}")
+            if self._peer is not None and self._current_session_id is not None:
+                try:
+                    await self._peer.publish(
+                        Topics.status(self.robot_id),
+                        {
+                            "source": "robot",
+                            "level": "error",
+                            "message": f"driver error on {cmd!r}: {exc}",
+                        },
+                    )
+                except Exception:
+                    pass  # don't let a publish failure mask the original
         # Literal type on CommandPayload.command makes "else" unreachable.
 
     async def _handle_status(self, topic: str, envelope: dict) -> None:
@@ -350,18 +384,29 @@ class CloudClient:
     async def _sensor_publish_loop(self, robot_id: str) -> None:
         """
         Read the driver's sensor state and publish it once per second.
+        Also republishes the current status alongside each sensor so any
+        peer that joined late or missed the initial "online" event sees
+        the robot's state within one publish interval.
 
         Runs until cancelled (peer teardown). The peer is the cancellation
         boundary — if peer.close() is called, the next publish() will fail
         and the task exits cleanly via the except clause.
         """
         sensor_topic = Topics.sensor(robot_id)
+        status_topic = Topics.status(robot_id)
+        driver_name = type(self._driver).__name__ if self._driver else "none"
+        status_payload = {
+            "source": "robot",
+            "level": "info",
+            "message": f"online ({driver_name})",
+        }
         try:
             while self._peer is not None:
                 if self._driver is not None:
                     payload = SensorPayload.model_validate(self._driver.read_sensor())
                     try:
                         await self._peer.publish(sensor_topic, payload.model_dump())
+                        await self._peer.publish(status_topic, status_payload)
                     except RuntimeError:
                         # Peer was closed between the check and the publish.
                         return
@@ -381,6 +426,19 @@ class CloudClient:
 
         if self._peer is not None:
             self._log.info(f"tearing down session ({reason})")
+            # Best-effort: announce we're going down. If the peer is already
+            # half-closed (network gone, cloud crashed) we don't care.
+            try:
+                await self._peer.publish(
+                    Topics.status(self.robot_id),
+                    {
+                        "source": "robot",
+                        "level": "info",
+                        "message": f"offline ({reason})",
+                    },
+                )
+            except Exception:
+                pass
             await self._peer.close()
             self._peer = None
         self._current_session_id = None
