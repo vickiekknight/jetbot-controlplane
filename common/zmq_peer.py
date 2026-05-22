@@ -1,24 +1,28 @@
 """
 ZmqPeer: one peer in the triangle pub/sub mesh.
-
-Each entity (robot, user, player) owns exactly one ZmqPeer. The peer:
-  - Binds a PUB socket on an OS-assigned endpoint.
-  - Connects N SUB sockets to other peers' PUB endpoints.
-  - Dispatches received messages to handlers registered by topic prefix.
-
-WIRE FORMAT (each ZMQ message is 2 frames):
-  Frame 0:  topic string, e.g. b"robot/robot-1/sensor"
-            ZMQ subscription filtering is prefix-match on this frame ONLY.
-  Frame 1:  JSON-encoded envelope:
-              {
-                "sender":         str,    # name of publishing peer
-                "publish_ts_ns":  int,    # time.time_ns() at publish
-                "payload":        dict,   # topic-specific (see schemas.py)
-              }
-
-The publish_ts_ns field is used by the latency benchmark to measure
-end-to-end delivery time without needing clock sync between entities,
-since both publisher and receiver are on the same host for the demo.
+ 
+Each entity (robot, user, player) owns exactly one ZmqPeer. The peer
+binds a PUB socket, connects N SUB sockets to other peers, and
+dispatches received messages to handlers registered by topic prefix.
+ 
+Transport is selected by ZMQ_TRANSPORT env var:
+  - "ipc" (default): Unix domain sockets at /tmp/zmq-peer-<name>-<rand>.sock.
+    Same-machine only, faster than TCP loopback, matches the spec's
+    single-machine scope.
+  - "tcp": TCP on the wildcard interface, OS-assigned ephemeral port.
+    Required for multi-host deployments.
+ 
+The transport choice is opaque to the rest of the system — peer_ready
+messages carry the full endpoint string ("ipc://..." or "tcp://...") and
+SUB sockets connect to whatever was advertised.
+ 
+Wire format: each ZMQ message is 2 frames.
+  Frame 0:  topic string, e.g. b"robot/robot-1/sensor".
+            Subscription filtering is prefix-match on this frame only.
+  Frame 1:  JSON envelope: {sender, publish_ts_ns, payload}.
+ 
+publish_ts_ns is recorded at publish time and used by the latency
+benchmark to measure end-to-end delivery without inter-host clock sync.
 """
 
 from __future__ import annotations

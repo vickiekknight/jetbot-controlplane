@@ -1,13 +1,12 @@
 """
 Live terminal dashboard for the user CLI.
-
-Renders three panels with Rich:
-
+ 
+Renders four panels with Rich:
+ 
   ┌─ Session ────────────────────────────────────────┐
   │ robot-1 (sess_abc123)   user=test   state=live   │
   └──────────────────────────────────────────────────┘
   ┌─ Telemetry ──────────────────────────────────────┐
-  │ Source     │ Value                               │
   │ Sensor     │ state=0.150 pose=(0.32, 0.00, 0.0)  │
   │ Processed  │ status=warning  (from Player)       │
   │ Status     │ all systems nominal                 │
@@ -15,17 +14,17 @@ Renders three panels with Rich:
   ┌─ Trail ──────────────────────────────────────────┐
   │ ......................r..............            │
   │ .........................r...........            │
-  │ (most recent positions on a small ASCII grid)    │
+  │ (recent positions on a small ASCII grid)         │
   └──────────────────────────────────────────────────┘
-
-The Dashboard is the *view*. The CLI updates it by calling
-update_sensor(), update_processed(), update_status() — all sync,
-thread-safe is unnecessary because they're only called from the asyncio
-event loop, but the Live renderer handles its own thread-safety.
-
-Trail uses a fixed-size character grid centered on the origin. Positions
-are quantized to grid cells; oldest positions are dimmer. This gives the
-demo a concrete "the robot is moving" visual without any actual graphics.
+  ┌─ Command ────────────────────────────────────────┐
+  │ forward | backward | left | right | stop | quit  │
+  │ >>> sent: forward                                │
+  └──────────────────────────────────────────────────┘
+ 
+Dashboard is the view layer. The CLI updates it by calling update_*
+methods, which trigger an immediate redraw. The trail uses a fixed-size
+character grid that auto-rescales to keep both the origin and the
+robot's current position visible.
 """
 
 from __future__ import annotations

@@ -1,20 +1,14 @@
 """
 Player's cloud client.
-
-Unlike the Robot, the Player does NOT register over HTTP — its existence
-is created by the cloud spawning it as a subprocess. The Player's
-"registration" is implicit: opening its WebSocket at /ws/player/{session_id}
-is what tells the cloud "I am alive and ready."
-
-The Player's WebSocket carries three message types:
-  - Incoming session_start: cloud asking the Player to bind its ZMQ peer.
-  - Outgoing peer_ready: Player reporting its bind endpoint.
-  - Incoming session_live: cloud broadcasting the full topology.
-  - Incoming session_end: cloud telling the Player to tear down.
-
-The Player owns its own ZmqPeer (the data-plane abstraction from common/).
-Step 6 wires the signaling lifecycle; step 7 will add the actual data flow
-(subscribing to sensor, publishing processed messages).
+ 
+Unlike the Robot, the Player does not register over HTTP — its existence
+is created when the cloud spawns it as a subprocess. Opening its
+WebSocket at /ws/player/{session_id} is what tells the cloud the Player
+is alive and ready.
+ 
+The Player owns its own ZmqPeer for the data plane: it binds a PUB,
+subscribes to the robot's sensor topic, classifies state magnitude into
+normal/warning/alert, and publishes the result on the processed topic.
 """
 
 from __future__ import annotations

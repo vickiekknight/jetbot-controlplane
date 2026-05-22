@@ -1,13 +1,11 @@
 """
 Session lifecycle state machine.
-
-A Session is the cloud's record of a "user wants to talk to a robot" request
-and its progression through the signaling handshake. Sessions are created
-when the user POSTs /sessions and torn down when the triangle dies.
-
-STATE MACHINE
-=============
-
+ 
+A Session is the cloud's record of a "user wants to talk to a robot"
+request and its progression through the signaling handshake. Sessions
+are created when the user POSTs /sessions and torn down when the
+triangle dies.
+ 
   REQUESTED
      │  cloud has accepted the user's request, allocated a session_id,
      │  and is about to spawn a Player subprocess.
@@ -27,27 +25,14 @@ STATE MACHINE
   LIVE
      │  Cloud has broadcast session_live (full topology) to all peers.
      │  Each peer has connected its SUBs to the other two PUBs.
-     │  The data plane is up. The cloud is now out of the data path.
+     │  The data plane is up. The cloud is out of the data path.
      │
      ▼  on disconnect / timeout / explicit end
   ENDED
-        Cloud has sent session_end to surviving peers and killed the
-        Player subprocess. Session record is retained briefly for
-        debuggability, then evicted.
-
-DESIGN NOTES
-============
-
-State transitions are gated by methods on Session (mark_spawning,
-record_peer_ready, end) — never by direct attribute mutation. This
-prevents bypassing invariants ("you can only enter LIVE after all three
-peer_ready arrived"). Invalid transitions raise InvalidTransition rather
-than silently drifting.
-
-The SessionManager owns all sessions and is the only place that creates
-or ends them. The signaling layer (signaling.py) calls into it; the
-HTTP layer (POST /sessions) calls into it; both never touch Session
-state directly.
+ 
+State transitions are gated by methods (mark_spawning, record_peer_ready,
+mark_live, end) — never by direct attribute mutation. Invalid transitions
+raise InvalidTransition rather than silently drifting.
 """
 
 from __future__ import annotations

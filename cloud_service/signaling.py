@@ -1,38 +1,14 @@
 """
-Signaling layer: WebSocket connection management + dead-robot eviction.
-
-In this step (step 4), the signaling WebSocket carries one message type:
-HeartbeatMessage. The robot opens a persistent WebSocket to the cloud
-right after registration and sends a heartbeat every N seconds. The
-cloud updates the registry's last_heartbeat_ts on receipt.
-
-In step 6, this same module will gain handlers for session_start /
-peer_ready / session_live / session_end. The SignalingMessage tagged
-union in schemas.py already covers those types — we just don't dispatch
-on them yet.
-
-CONNECTION MANAGER:
-We keep a per-robot WebSocket reference in ConnectionManager. This serves
-two purposes:
-  1. Heartbeat tracking: incoming heartbeats look up the WebSocket's
-     robot_id to update the right registry entry.
-  2. Outbound signaling (step 6): when the cloud needs to push a
-     session_start to a specific robot, it looks up the WebSocket here.
-
-DEAD-ROBOT EVICTION:
-A background task runs every HEARTBEAT_CHECK_INTERVAL_S seconds, scans the
-registry, and marks any robot offline whose last heartbeat is older than
-HEARTBEAT_TIMEOUT_S. The thresholds are conservative (3x the heartbeat
-interval) to tolerate transient network blips without false eviction.
-
-DESIGN: WHY MARK_OFFLINE INSTEAD OF REMOVE
-A dead robot is moved to "offline" status but kept in the registry. The
-alternative (remove from registry) would mean users running `user list`
-right after a robot crash would not see it at all, with no record that
-it ever existed. Marking offline preserves visibility ("robot-1 was
-here, currently down") which is useful for operators triaging incidents.
-The robot can re-register on restart, which transitions it back to online
-via touch_heartbeat (see Registry).
+WebSocket signaling and session orchestration.
+ 
+This module handles the cloud's WebSocket endpoints (for robots, users,
+and players), tracks active connections via ConnectionManager, drives
+session lifecycle through SessionOrchestrator, and runs the dead-robot
+eviction sweep.
+ 
+Dead robots are marked offline rather than removed from the registry so
+operators triaging incidents can see "robot was here, currently down".
+Re-registration brings them back online via touch_heartbeat.
 """
 
 from __future__ import annotations

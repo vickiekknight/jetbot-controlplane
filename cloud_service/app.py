@@ -1,29 +1,15 @@
 """
-FastAPI app for the cloud service control plane.
-
-This module defines three REST endpoints:
-
-  POST /robots/register   Robot announces itself on startup.
-  GET  /robots            User lists currently-registered robots.
-  POST /sessions          User requests a session with a specific robot.
-
-The signaling WebSocket endpoints (which heartbeat and orchestrate
-sessions) are added in step 4 and step 6.
-
-DESIGN:
+FastAPI app for the cloud control plane.
+ 
+Three REST endpoints (robot register, robot list, session create) plus
+three WebSocket endpoints (robot, user, and player signaling channels).
+ 
 The app is constructed via a factory function (create_app) rather than
-declared at module scope. This is because:
-  - Tests can construct independent app instances with fresh Registry
-    state, without module-level mutable globals leaking between tests.
-  - The factory can take configuration (public URL for advertised
-    WebSocket URLs in responses) without environment-variable side
-    effects.
-  - Multiple apps can coexist in the same process if needed
-    (multi-region scenarios, mocked downstream services, etc.).
-
-The Registry is attached to app.state and accessed via a FastAPI
-dependency, which makes it overridable in tests (dependency_overrides)
-and clear from the function signature what each handler needs.
+declared at module scope, so tests can build independent app instances
+with fresh Registry and SessionOrchestrator state. The Registry,
+ConnectionManager, and SessionOrchestrator are attached to app.state
+and accessed by handlers via FastAPI dependencies — making them
+overridable in tests and explicit at handler boundaries.
 """
 
 from __future__ import annotations

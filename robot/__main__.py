@@ -1,20 +1,12 @@
 """
 Robot process entry point.
-
+ 
 Usage:
     python -m robot --id robot-1 --cloud-url http://localhost:8000
-
-Wires together a FakeJetBot, the CloudClient (registration + heartbeat),
-and a tick loop that integrates simulation physics. The data plane (ZMQ
-peer for sensor publishing and command subscription) is added in step 6
-once the cloud's session signaling exists.
-
-LIFECYCLE:
-On startup, the robot's main task is:
-  1. Construct a FakeJetBot instance.
-  2. Start the CloudClient (it registers with the cloud and begins heartbeats).
-  3. Start the tick loop integrating FakeJetBot physics.
-  4. Wait for SIGINT/SIGTERM. On signal, cancel all tasks and exit cleanly.
+ 
+Constructs a FakeJetBot, attaches it to a CloudClient (which handles
+registration, heartbeat, and the data-plane ZmqPeer), and runs a physics
+tick loop until SIGINT/SIGTERM.
 """
 
 from __future__ import annotations

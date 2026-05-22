@@ -1,22 +1,17 @@
 """
-Robot's client for talking to the cloud service.
-
-Two responsibilities:
-  1. REST register on startup — announce existence, get the WebSocket URL.
-  2. Maintain a long-lived WebSocket to the cloud, sending heartbeats
-     every HEARTBEAT_INTERVAL_S seconds.
-
-The signaling WebSocket also carries session_start / session_live messages
-in step 6 — for now, this client only sends heartbeats and ignores
-inbound messages. The receive loop exists so we observe disconnection
-promptly (otherwise we'd send forever into a closed socket).
-
-RECONNECTION:
-On WebSocket disconnect, the client reconnects with exponential backoff
-(1s, 2s, 4s, capped at 30s). Each reconnect retries the full register +
-WebSocket flow, since the cloud may have evicted the robot during the
-outage. This is what makes the robot self-healing across cloud restarts,
-network blips, and transient host issues.
+The robot's network client.
+ 
+Three responsibilities:
+  1. Register with the cloud over HTTP on startup.
+  2. Maintain a long-lived signaling WebSocket: send heartbeats, receive
+     session_start / session_live / session_end.
+  3. Manage the data-plane ZmqPeer for the active session — bind on
+     session_start, connect SUBs on session_live, tear down on session_end.
+ 
+On WebSocket disconnect the client reconnects with jittered exponential
+backoff (1s, 2s, 4s, capped at 30s). Each reconnect retries the full
+register + WebSocket flow, since the cloud may have evicted the robot
+during the outage.
 """
 
 from __future__ import annotations

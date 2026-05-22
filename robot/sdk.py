@@ -1,42 +1,23 @@
 """
-Robot SDK: the boundary between the network layer and the simulated hardware.
-
-This module provides:
-
-  - RobotDriver: a Protocol describing the interface a "robot driver" must
-    expose. Anything that satisfies this protocol can be used as the robot's
-    underlying control surface. The protocol mirrors the public API of
-    NVIDIA's jetbot.Robot class so that, in production, a real-hardware
-    driver could replace the simulated one without changes elsewhere.
-
-  - FakeJetBot: a pure-Python implementation of RobotDriver. Models a
-    differential-drive robot with two motors (normalized speeds in [-1, 1])
-    integrating planar pose (x, y, theta) over time. No physics engine
-    dependency; the kinematics are a textbook unicycle model.
-
-DESIGN BOUNDARY:
-This module is deliberately I/O-free. It does no networking, no async, no
-threading, no logging beyond what the caller wires up. The robot process
-(robot/__main__.py, to come later) is responsible for:
-
-  - Calling step(dt) at a fixed rate to integrate motion.
-  - Calling read_sensor() periodically to gather data for ZMQ publishing.
-  - Dispatching incoming command messages to the appropriate driver method.
-
-Keeping the SDK side I/O-free means:
-
-  - It's trivial to unit test (no fixtures, no async, no mocks).
-  - It can be swapped for a different driver (real hardware, PyBullet,
-    Isaac Sim) without touching the network code.
-  - It can be reused outside the robot process if needed (e.g. by a
-    benchmark or a synthetic command replay tool).
-
-The official jetbot.Robot API methods being mirrored:
-  forward(speed) / backward(speed) / left(speed) / right(speed) / stop()
-  set_motors(left, right)
-  left_motor.value, right_motor.value   (readable motor state)
-
-Source reference: github.com/NVIDIA-AI-IOT/jetbot/blob/master/jetbot/robot.py
+Robot SDK: the boundary between the network layer and the simulated
+hardware.
+ 
+  - RobotDriver: a Protocol that mirrors NVIDIA's jetbot.Robot public
+    API (forward / backward / left / right / stop / set_motors). Any
+    implementation of this protocol can plug into the rest of the
+    system — FakeJetBot, real JetBot hardware, PyBullet, Isaac Sim.
+ 
+  - FakeJetBot: a pure-Python RobotDriver. Differential-drive kinematics
+    (two motors with normalized speeds in [-1, 1]) integrating planar
+    pose (x, y, theta) over time using a textbook unicycle model.
+ 
+This module is deliberately I/O-free: no networking, no async, no
+logging beyond what the caller wires up. The robot process is
+responsible for calling step(dt) periodically and dispatching incoming
+commands. Keeping I/O out of the SDK is what makes it trivially unit-
+testable and swappable.
+ 
+jetbot reference: github.com/NVIDIA-AI-IOT/jetbot/blob/master/jetbot/robot.py
 """
 
 from __future__ import annotations

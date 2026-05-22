@@ -1,28 +1,17 @@
 """
-Robot registry: in-memory tracking of which robots are currently registered
-with the cloud service.
-
-This is deliberately kept simple — a thread-safe dict keyed by robot_id.
-The complexity of "online vs offline" lifecycle (heartbeat tracking, dead-
-robot eviction) is added in step 4 when the WebSocket layer lands. For
-now, registration creates an entry; lookup and listing are O(1) and O(N)
-respectively.
-
-WHY IN-MEMORY:
-For a take-home, in-memory state is the right call. The spec scenario
-(one cloud, single host, demo on one machine) doesn't need persistence,
-and adding Redis/Postgres would be 80% setup overhead and 20% added
-correctness. The Registry is designed so a future swap to a backing
-store (Redis, etcd, Postgres) would change only this file — the FastAPI
-handlers and signaling code take a Registry-shaped dependency and don't
-know it's a dict.
-
-WHY THREAD-SAFE:
-FastAPI runs handlers concurrently. Even though we use async handlers
-(which run on a single event loop thread), uvicorn's threadpool can
-execute sync code on worker threads, and dependency injection can run
-sync code. Defensive locking costs near-nothing and removes a class of
-"works in tests, breaks under load" failure modes.
+Robot registry: in-memory tracking of which robots are currently
+registered with the cloud.
+ 
+A thread-safe dict keyed by robot_id. Registration is replace-on-
+duplicate so a robot that crashed and restarted can come back online
+without manual deregistration. Heartbeat tracking moves robots between
+online and offline status without removing the entry — operators
+listing robots after a crash should still see "robot was here,
+currently down".
+ 
+The Registry takes a Registry-shaped dependency in the handlers and
+signaling code, so swapping in a backing store (Redis, Postgres) would
+change only this file.
 """
 
 from __future__ import annotations
