@@ -1,6 +1,6 @@
 # JetBot Control Plane
 
-A small distributed system that orchestrates a triangle of pub/sub peers — robot, user, and per-session inference worker ("player") — connected through a thin cloud orchestrator. Built as a take-home for General Robotics; modeled on the GRID architecture (cloud control plane + per-robot inference workers + direct peer-to-peer data plane).
+A small distributed system that orchestrates a triangle of pub/sub peers — robot, user, and per-session inference worker ("player") — connected through a thin cloud orchestrator.
 
 ## Quickstart
 
