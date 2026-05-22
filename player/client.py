@@ -28,15 +28,44 @@ from pydantic import TypeAdapter, ValidationError
 from common.logging import get_logger
 from common.schemas import (
     PeerReadyMessage,
+    ProcessedPayload,
+    SensorPayload,
     SessionEndMessage,
     SessionLiveMessage,
     SessionStartMessage,
     SignalingMessage,
 )
+from common.topics import Topics
 from common.zmq_peer import ZmqPeer
 
 
 _signaling_decoder = TypeAdapter(SignalingMessage)
+
+
+# Thresholds for the sensor-state → status classifier.
+# State is the robot's |linear velocity|, bounded by FakeJetBot.max_speed = 0.3.
+# Two break points partition the range into three bands.
+#
+# These are class-level rather than per-instance because they're a property of
+# the (Player, RobotDriver) pair. A different driver (PyBullet with a different
+# max_speed) would want different bounds — we'd derive them from the driver's
+# physical parameters in a production system. For the take-home, hardcoding to
+# the FakeJetBot range is fine; documenting the calibration is what matters.
+CLASSIFIER_WARNING_THRESHOLD = 0.10  # below: "normal"
+CLASSIFIER_ALERT_THRESHOLD = 0.20    # at/above: "alert"; in-between: "warning"
+
+
+def classify_state(state: float) -> str:
+    """
+    Map a raw |velocity| value to one of {normal, warning, alert}.
+
+    Pure function so it can be unit-tested without spinning up the Player.
+    """
+    if state >= CLASSIFIER_ALERT_THRESHOLD:
+        return "alert"
+    if state >= CLASSIFIER_WARNING_THRESHOLD:
+        return "warning"
+    return "normal"
 
 
 class PlayerClient:
@@ -57,6 +86,9 @@ class PlayerClient:
         self._log = get_logger(f"player.client.{session_id}")
         self._peer: Optional[ZmqPeer] = None
         self._stop = asyncio.Event()
+        # Cached robot_id captured from session_live for the publish loop;
+        # equals self.robot_id by construction, but reads cleaner in handlers.
+        self._robot_id_for_publishing: str = robot_id
 
     @property
     def peer(self) -> Optional[ZmqPeer]:
@@ -135,19 +167,71 @@ class PlayerClient:
 
     async def _on_session_live(self, msg: SessionLiveMessage) -> None:
         """
-        Connect SUBs to the robot's and user's PUB endpoints. Subscriptions
-        are stubbed in step 6 — we subscribe to "" (everything) so the test
-        can verify the connections were established. Step 7 narrows the
-        subscriptions to robot/{id}/sensor and robot/{id}/status.
+        Connect SUBs to the robot's and user's PUB endpoints.
+
+        Subscription topics (per spec table):
+          - robot/{id}/sensor from Robot (we classify and republish)
+          - robot/{id}/status from anyone (we log; useful for debugging)
+
+        We do NOT subscribe to robot/{id}/command — that's User→Robot only.
+        We do NOT subscribe to our own publication robot/{id}/processed.
         """
         if self._peer is None:
             self._log.error("session_live received before session_start; refusing")
             return
+
         robot_endpoint = msg.topology["robot"]
         user_endpoint = msg.topology["user"]
-        await self._peer.connect_to_peer(robot_endpoint, subscribe_to=[""])
-        await self._peer.connect_to_peer(user_endpoint, subscribe_to=[""])
+        rid = msg.robot_id
+
+        sensor_topic = Topics.sensor(rid)
+        status_topic = Topics.status(rid)
+
+        # Robot publishes sensor + status; subscribe to both from Robot's PUB.
+        await self._peer.connect_to_peer(
+            robot_endpoint, subscribe_to=[sensor_topic, status_topic]
+        )
+        # User publishes command (not for us) + status; subscribe to status only.
+        await self._peer.connect_to_peer(
+            user_endpoint, subscribe_to=[status_topic]
+        )
+
+        # Register handlers.
+        self._peer.on(sensor_topic, self._handle_sensor)
+
         await self._peer.start()
+        self._robot_id_for_publishing = rid
         self._log.info(
             f"player triangle live: robot={robot_endpoint}, user={user_endpoint}"
         )
+
+    async def _handle_sensor(self, topic: str, envelope: dict) -> None:
+        """
+        Incoming sensor → classify → republish on processed.
+
+        This is the Player's entire data-plane responsibility for step 7.
+        In a production system, this slot would hold an inference workload
+        (object detection on camera frames, RL policy inference, etc.) — the
+        threshold classifier is a placeholder that demonstrates the
+        "sensor in, processed out" pattern.
+        """
+        try:
+            payload = SensorPayload.model_validate(envelope.get("payload", {}))
+        except ValidationError as exc:
+            self._log.warning(f"malformed sensor payload, dropping: {exc}")
+            return
+
+        status = classify_state(payload.state)
+        processed = ProcessedPayload(
+            state=payload.state,
+            status=status,
+            source_publish_ts_ns=envelope.get("publish_ts_ns", 0),
+        )
+        try:
+            await self._peer.publish(
+                Topics.processed(self._robot_id_for_publishing),
+                processed.model_dump(),
+            )
+        except RuntimeError:
+            # Peer closed mid-publish (session ending). Drop quietly.
+            return

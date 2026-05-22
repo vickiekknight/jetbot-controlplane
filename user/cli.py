@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import asyncio
 import signal
+import sys
 import uuid
+from typing import AsyncIterator, Optional
 
 import typer
 from rich.console import Console
@@ -28,10 +30,12 @@ from rich.table import Table
 from common.logging import configure_logging
 from user.client import (
     UserClientError,
+    UserSession,
     list_robots,
-    open_user_signaling,
+    open_user_signaling,  # kept for any external import compatibility
     request_session,
 )
+from user.dashboard import Dashboard, DashboardState
 
 
 app = typer.Typer(
@@ -97,17 +101,13 @@ def cmd_connect(
     ),
 ) -> None:
     """
-    Request a session with a specific robot and stay connected.
+    Request a session with a specific robot and run the live dashboard.
 
-    Today this opens the user's signaling WebSocket and waits. Once the
-    triangle handshake is implemented (step 6), it will additionally:
-      - Display a status indicator while waiting for the triangle to come up.
-      - Start the user's ZMQ peer once `session_live` arrives.
-      - Accept interactive command input (forward, left, stop, etc.).
+    Once the triangle is up, sensor + processed messages stream in and
+    are rendered in a Rich Live display. Type commands at the prompt
+    (forward / backward / left / right / stop / quit) to drive the robot.
     """
     if user_id is None:
-        # Generate a short random user_id so the cloud's logs can distinguish
-        # concurrent users without forcing the operator to invent one.
         user_id = f"user-{uuid.uuid4().hex[:8]}"
 
     try:
@@ -116,44 +116,175 @@ def cmd_connect(
         err_console.print(f"error: {exc}")
         raise typer.Exit(code=1)
     except KeyboardInterrupt:
-        # asyncio.run propagates KeyboardInterrupt out cleanly; we just
-        # ensure the user sees a final message rather than a stack trace.
         console.print("\n[yellow]interrupted; exiting[/yellow]")
+
+
+# Commands the user can type at the prompt. Mapped to (SDK method, default speed).
+VALID_COMMANDS = {"forward", "backward", "left", "right", "stop"}
+
+
+async def _stdin_lines(stop: asyncio.Event) -> AsyncIterator[str]:
+    """
+    Async generator that yields lines from stdin as the user presses Enter.
+
+    Uses asyncio's `loop.add_reader` rather than `aioconsole.ainput` (which
+    spawned a thread). Reasons we prefer the reader approach:
+
+      1. No executor thread → no teardown noise. `aioconsole` left a Python
+         thread blocked in stdin.read() during shutdown; that thread would
+         try to interact with the closed event loop and raise visible
+         RuntimeErrors on the terminal.
+      2. Clean cancellation. add_reader is a native asyncio primitive that
+         we explicitly unregister in the finally block.
+      3. No external dependency for what's a half-screen of code.
+
+    Caveat: loop.add_reader is POSIX-only. On Windows this returns
+    immediately without reading anything, degrading gracefully — the
+    dashboard still works, just without command input. (Acceptable for a
+    take-home that targets a single Linux/Mac host per the spec.)
+    """
+    loop = asyncio.get_event_loop()
+    queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+
+    def _on_readable():
+        try:
+            line = sys.stdin.readline()
+        except Exception:
+            line = ""
+        queue.put_nowait(line if line else None)  # None signals EOF
+
+    try:
+        loop.add_reader(sys.stdin.fileno(), _on_readable)
+    except (NotImplementedError, ValueError, OSError):
+        return  # not a tty or platform doesn't support add_reader
+
+    try:
+        while not stop.is_set():
+            try:
+                line = await asyncio.wait_for(queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            if line is None:  # EOF
+                return
+            yield line
+    finally:
+        try:
+            loop.remove_reader(sys.stdin.fileno())
+        except (ValueError, OSError, NotImplementedError):
+            pass
 
 
 async def _connect_async(cloud_url: str, robot_id: str, user_id: str) -> None:
     """
-    Inner async flow:
-      1. POST /sessions to get a session_id and user-side websocket_url.
-      2. Open the WebSocket and stream inbound messages until stopped.
+    Full connect flow:
+      1. POST /sessions to get session_id and websocket_url.
+      2. Construct UserSession; wire up Dashboard callbacks.
+      3. Run signaling loop + input loop concurrently inside Live.
     """
     console.print(
         f"requesting session: [cyan]robot={robot_id}[/cyan] user=[cyan]{user_id}[/cyan]"
     )
-    session = await request_session(cloud_url, robot_id, user_id)
-    console.print(f"[green]session created:[/green] {session.session_id}")
-    console.print(f"opening signaling WebSocket: [dim]{session.websocket_url}[/dim]")
+    session_resp = await request_session(cloud_url, robot_id, user_id)
+    console.print(f"[green]session created:[/green] {session_resp.session_id}")
+    console.print(
+        f"opening signaling WebSocket: [dim]{session_resp.websocket_url}[/dim]"
+    )
 
     stop = asyncio.Event()
-    loop = asyncio.get_event_loop()
+    user_session = UserSession(
+        websocket_url=session_resp.websocket_url,
+        session_id=session_resp.session_id,
+        robot_id=robot_id,
+    )
 
-    # Translate SIGINT into our stop event so the WebSocket closes cleanly.
-    # On Windows asyncio doesn't support add_signal_handler; we fall back to
-    # KeyboardInterrupt propagation.
+    dash_state = DashboardState(
+        robot_id=robot_id,
+        session_id=session_resp.session_id,
+        user_id=user_id,
+    )
+    dashboard = Dashboard(dash_state)
+
+    # Wire UserSession callbacks → dashboard updates.
+    async def on_sensor(env: dict): dashboard.update_sensor(env)
+    async def on_processed(env: dict): dashboard.update_processed(env)
+    async def on_status(env: dict): dashboard.update_status(env)
+    user_session.on_sensor = on_sensor
+    user_session.on_processed = on_processed
+    user_session.on_status = on_status
+
+    # SIGINT → graceful exit.
+    loop = asyncio.get_event_loop()
     try:
         loop.add_signal_handler(signal.SIGINT, stop.set)
         loop.add_signal_handler(signal.SIGTERM, stop.set)
     except (NotImplementedError, RuntimeError):
         pass
 
-    console.print(
-        "[green]connected.[/green] "
-        "[dim]Triangle setup arrives in step 6. "
-        "Press Ctrl+C to disconnect.[/dim]"
-    )
+    async def signaling_loop():
+        try:
+            async for evt in user_session.events(stop):
+                dashboard.set_session_state(evt if evt != "live" else "live")
+                if evt.startswith("ended:"):
+                    stop.set()
+                    break
+        except UserClientError as exc:
+            err_console.print(f"error: {exc}")
+            stop.set()
 
-    async for msg in open_user_signaling(session.websocket_url, stop):
-        console.print(f"[cyan]<- cloud:[/cyan] {msg}")
+    async def input_loop():
+        # Wait until the session is LIVE before accepting input — sending
+        # commands before then would just be dropped.
+        while not stop.is_set() and dash_state.session_state != "live":
+            await asyncio.sleep(0.1)
+        async for line in _stdin_lines(stop):
+            line = line.strip().lower()
+            if not line:
+                continue
+            if line in ("quit", "exit", "q"):
+                stop.set()
+                break
+            if line in VALID_COMMANDS:
+                await user_session.send_command(line, speed=0.5)
+                dashboard.set_input_buffer(f"sent: {line}")
+            else:
+                dashboard.set_input_buffer(f"unknown: {line!r}")
+
+    async def refresh_loop():
+        """
+        Background heartbeat that calls dashboard.refresh() every 100ms.
+
+        Even though every update_* method already triggers a refresh, this
+        heartbeat protects against:
+          - The session sitting in "live" with no incoming data yet — without
+            this, the dashboard would freeze on "waiting..." until the first
+            sensor arrives a second later.
+          - Any subtle terminal/render issues where a single repaint gets
+            dropped — the next tick re-issues it.
+        """
+        while not stop.is_set():
+            try:
+                dashboard.refresh()
+            except Exception:
+                pass  # never let a render glitch kill the loop
+            await asyncio.sleep(0.1)
+
+    with dashboard.live():
+        sig_task = asyncio.create_task(signaling_loop(), name="signaling")
+        inp_task = asyncio.create_task(input_loop(), name="input")
+        ref_task = asyncio.create_task(refresh_loop(), name="refresh")
+        try:
+            # Run until either user-facing task finishes (signaling ends or
+            # user quits). The refresh loop is purely a background helper —
+            # we don't want its completion to drive exit.
+            await asyncio.wait(
+                [sig_task, inp_task], return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            stop.set()
+            for task in (sig_task, inp_task, ref_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(sig_task, inp_task, ref_task, return_exceptions=True)
 
     console.print("[yellow]disconnected.[/yellow]")
 

@@ -63,6 +63,9 @@ async def main_async(args: argparse.Namespace) -> None:
         cloud_url=args.cloud_url,
         metadata={"driver": "FakeJetBot"},
     )
+    # Attach the SDK so the CloudClient's command handler and sensor publish
+    # loop have something to dispatch into / read from.
+    client.set_driver(bot)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()

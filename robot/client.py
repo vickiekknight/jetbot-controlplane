@@ -31,16 +31,21 @@ from pydantic import TypeAdapter, ValidationError
 
 from common.logging import get_logger
 from common.schemas import (
+    CommandPayload,
     HeartbeatMessage,
     PeerReadyMessage,
     RobotRegisterRequest,
     RobotRegisterResponse,
+    SensorPayload,
     SessionEndMessage,
     SessionLiveMessage,
     SessionStartMessage,
     SignalingMessage,
+    StatusPayload,
 )
+from common.topics import Topics
 from common.zmq_peer import ZmqPeer
+from robot.sdk import RobotDriver
 
 
 _signaling_decoder = TypeAdapter(SignalingMessage)
@@ -87,7 +92,25 @@ class CloudClient:
         # Reference to the active WebSocket so handlers can send peer_ready.
         self._ws = None
 
+        # The robot driver (FakeJetBot or equivalent) that incoming commands
+        # are dispatched to and sensor data is read from. Attached by the
+        # robot process via set_driver(); without one, commands are dropped
+        # and sensor publishes are skipped (useful for tests of the signaling
+        # layer in isolation).
+        self._driver: Optional[RobotDriver] = None
+
+        # Sensor publish cadence. Spec: "every second". Tunable for benchmarks.
+        self._sensor_publish_interval_s: float = 1.0
+        self._sensor_task: Optional[asyncio.Task] = None
+
         self._stop = asyncio.Event()
+
+    def set_driver(self, driver: RobotDriver) -> None:
+        """
+        Attach a driver. Must be called before .run(); the cloud client
+        otherwise has no SDK to dispatch commands into.
+        """
+        self._driver = driver
 
     @property
     def peer(self) -> Optional[ZmqPeer]:
@@ -236,22 +259,131 @@ class CloudClient:
         )
 
     async def _on_session_live(self, msg: SessionLiveMessage) -> None:
-        """Connect SUBs to player and user PUBs. Step 7 narrows subscriptions."""
+        """
+        Connect SUBs to player and user PUBs.
+
+        Subscription topics (per the spec's topic table):
+          - robot/{id}/command from User (we dispatch into the SDK)
+          - robot/{id}/status  from anyone (we log; future: react to peer state)
+
+        We do NOT subscribe to robot/{id}/sensor because that's our own
+        publication. We do NOT subscribe to robot/{id}/processed because
+        the spec says only User consumes it.
+        """
         if self._peer is None:
             self._log.error("session_live received before session_start; refusing")
             return
+
         player_endpoint = msg.topology["player"]
         user_endpoint = msg.topology["user"]
-        await self._peer.connect_to_peer(player_endpoint, subscribe_to=[""])
-        await self._peer.connect_to_peer(user_endpoint, subscribe_to=[""])
+        rid = msg.robot_id
+
+        command_topic = Topics.command(rid)
+        status_topic = Topics.status(rid)
+
+        # User publishes commands; subscribe to User's PUB for that topic.
+        await self._peer.connect_to_peer(
+            user_endpoint, subscribe_to=[command_topic, status_topic]
+        )
+        # Player publishes processed (not for us) and status; subscribe to status only.
+        await self._peer.connect_to_peer(
+            player_endpoint, subscribe_to=[status_topic]
+        )
+
+        # Register the handler that dispatches commands into the driver.
+        self._peer.on(command_topic, self._handle_command)
+        self._peer.on(status_topic, self._handle_status)
+
         await self._peer.start()
         self._log.info(
             f"session {msg.session_id}: triangle live "
             f"(player={player_endpoint}, user={user_endpoint})"
         )
 
+        # Kick off the sensor publish loop. It runs until the peer is torn down.
+        self._sensor_task = asyncio.create_task(
+            self._sensor_publish_loop(rid),
+            name=f"{self.robot_id}-sensor-publish",
+        )
+
+    async def _handle_command(self, topic: str, envelope: dict) -> None:
+        """
+        Dispatch an incoming command to the robot driver.
+
+        The driver is None when CloudClient is used standalone (e.g. tests
+        of the registration flow). When the robot process wires a real
+        FakeJetBot in via set_driver(), commands flow through to it.
+        """
+        if self._driver is None:
+            self._log.warning(f"received command {envelope!r} but no driver attached")
+            return
+
+        try:
+            payload = CommandPayload.model_validate(envelope.get("payload", {}))
+        except ValidationError as exc:
+            self._log.warning(f"malformed command payload, dropping: {exc}")
+            return
+
+        speed = payload.speed if payload.speed is not None else 0.5
+        cmd = payload.command
+        self._log.info(f"executing command: {cmd} speed={speed}")
+
+        # The driver methods are sync (matches jetbot's API); they don't
+        # block long enough to need to be offloaded.
+        if cmd == "forward":
+            self._driver.forward(speed)
+        elif cmd == "backward":
+            self._driver.backward(speed)
+        elif cmd == "left":
+            self._driver.left(speed)
+        elif cmd == "right":
+            self._driver.right(speed)
+        elif cmd == "stop":
+            self._driver.stop()
+        # Literal type on CommandPayload.command makes "else" unreachable.
+
+    async def _handle_status(self, topic: str, envelope: dict) -> None:
+        """Log inbound status messages. Future: react to peer health/alerts."""
+        try:
+            payload = StatusPayload.model_validate(envelope.get("payload", {}))
+        except ValidationError:
+            return  # silently drop malformed status
+        self._log.info(
+            f"status from {payload.source}: [{payload.level}] {payload.message}"
+        )
+
+    async def _sensor_publish_loop(self, robot_id: str) -> None:
+        """
+        Read the driver's sensor state and publish it once per second.
+
+        Runs until cancelled (peer teardown). The peer is the cancellation
+        boundary — if peer.close() is called, the next publish() will fail
+        and the task exits cleanly via the except clause.
+        """
+        sensor_topic = Topics.sensor(robot_id)
+        try:
+            while self._peer is not None:
+                if self._driver is not None:
+                    payload = SensorPayload.model_validate(self._driver.read_sensor())
+                    try:
+                        await self._peer.publish(sensor_topic, payload.model_dump())
+                    except RuntimeError:
+                        # Peer was closed between the check and the publish.
+                        return
+                await asyncio.sleep(self._sensor_publish_interval_s)
+        except asyncio.CancelledError:
+            pass
+
     async def _teardown_session(self, reason: str) -> None:
         """Close the ZmqPeer and clear session state. Idempotent."""
+        if self._sensor_task is not None and not self._sensor_task.done():
+            self._sensor_task.cancel()
+            try:
+                await self._sensor_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._sensor_task = None
+
         if self._peer is not None:
             self._log.info(f"tearing down session ({reason})")
             await self._peer.close()

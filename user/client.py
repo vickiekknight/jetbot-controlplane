@@ -20,7 +20,7 @@ This layer handles:
 from __future__ import annotations
 
 import asyncio
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Awaitable, Callable, Optional
 
 import httpx
 import websockets
@@ -28,6 +28,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from common.logging import get_logger
 from common.schemas import (
+    CommandPayload,
     PeerReadyMessage,
     RobotInfo,
     RobotListResponse,
@@ -38,6 +39,7 @@ from common.schemas import (
     SessionStartMessage,
     SignalingMessage,
 )
+from common.topics import Topics
 from common.zmq_peer import ZmqPeer
 
 
@@ -95,23 +97,51 @@ async def request_session(
 
 class UserSession:
     """
-    Drives the user side of the three-phase signaling handshake.
+    Drives the user side of the three-phase signaling handshake AND the
+    data plane.
 
     Usage:
-        session = UserSession(websocket_url, session_id)
+        session = UserSession(websocket_url, session_id, robot_id)
+        session.on_sensor = lambda env: ...
+        session.on_processed = lambda env: ...
+        session.on_status = lambda env: ...
         async for event in session.events(stop_event):
-            # event is one of: "started", "live", "ended:<reason>"
             ...
+        # while session is live:
+        await session.send_command("forward", speed=0.5)
     """
 
-    def __init__(self, websocket_url: str, session_id: str):
+    def __init__(self, websocket_url: str, session_id: str, robot_id: Optional[str] = None):
         self.websocket_url = websocket_url
         self.session_id = session_id
+        # robot_id is needed to construct topic strings for publishing
+        # commands. It's optional at construction time because legacy callers
+        # don't have it; the cloud also sends it in session_start so we can
+        # capture it then.
+        self.robot_id: Optional[str] = robot_id
         self._peer: Optional[ZmqPeer] = None
+
+        # Caller-set callbacks for inbound data-plane messages. Each callback
+        # receives the *envelope* dict (sender, publish_ts_ns, payload).
+        self.on_sensor: Optional[Callable[[dict], Awaitable[None]]] = None
+        self.on_processed: Optional[Callable[[dict], Awaitable[None]]] = None
+        self.on_status: Optional[Callable[[dict], Awaitable[None]]] = None
 
     @property
     def peer(self) -> Optional[ZmqPeer]:
         return self._peer
+
+    async def send_command(self, command: str, speed: float = 0.5) -> None:
+        """Publish a CommandPayload to robot/{id}/command. No-op if not live."""
+        if self._peer is None or self.robot_id is None:
+            return
+        payload = CommandPayload(command=command, speed=speed)
+        try:
+            await self._peer.publish(
+                Topics.command(self.robot_id), payload.model_dump()
+            )
+        except (RuntimeError, ValidationError):
+            pass
 
     async def events(self, stop: asyncio.Event) -> AsyncIterator[str]:
         """
@@ -140,11 +170,32 @@ class UserSession:
         while not stop.is_set():
             recv = asyncio.create_task(ws.recv())
             stop_task = asyncio.create_task(stop.wait())
-            done, pending = await asyncio.wait(
-                [recv, stop_task], return_when=asyncio.FIRST_COMPLETED
-            )
+            try:
+                done, pending = await asyncio.wait(
+                    [recv, stop_task], return_when=asyncio.FIRST_COMPLETED
+                )
+            except asyncio.CancelledError:
+                # External cancellation (the outer finally block cancelled
+                # us). asyncio.wait's natural behaviour leaves recv/stop_task
+                # *orphaned* — recv will then complete later with a
+                # ConnectionClosedOK that nobody retrieves, producing an
+                # "Task exception was never retrieved" warning at shutdown.
+                # Drain them explicitly and re-raise.
+                for t in (recv, stop_task):
+                    t.cancel()
+                    try:
+                        await t
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                raise
+            # Normal path: one of the two tasks finished. Cancel the other
+            # AND await it so its result/exception is consumed.
             for t in pending:
                 t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
             if stop_task in done:
                 return
             try:
@@ -159,6 +210,8 @@ class UserSession:
                 continue
 
             if isinstance(msg, SessionStartMessage):
+                # Capture robot_id from the message so send_command works.
+                self.robot_id = msg.robot_id
                 await self._on_session_start(ws, msg)
                 yield "started"
             elif isinstance(msg, SessionLiveMessage):
@@ -182,13 +235,46 @@ class UserSession:
         _log.info(f"user peer bound at {endpoint}; peer_ready sent")
 
     async def _on_session_live(self, msg: SessionLiveMessage) -> None:
+        """
+        Connect SUBs to the robot's and player's PUB endpoints.
+
+        Subscription topics (per spec table):
+          - robot/{id}/sensor    from Robot  (raw sensor)
+          - robot/{id}/processed from Player (Player's classification)
+          - robot/{id}/status    from anyone
+        """
         if self._peer is None:
             _log.error("session_live received before session_start; refusing")
             return
+        rid = msg.robot_id
+        sensor_topic = Topics.sensor(rid)
+        processed_topic = Topics.processed(rid)
+        status_topic = Topics.status(rid)
+
         robot_endpoint = msg.topology["robot"]
         player_endpoint = msg.topology["player"]
-        await self._peer.connect_to_peer(robot_endpoint, subscribe_to=[""])
-        await self._peer.connect_to_peer(player_endpoint, subscribe_to=[""])
+
+        # Robot publishes sensor + status.
+        await self._peer.connect_to_peer(
+            robot_endpoint, subscribe_to=[sensor_topic, status_topic]
+        )
+        # Player publishes processed + status.
+        await self._peer.connect_to_peer(
+            player_endpoint, subscribe_to=[processed_topic, status_topic]
+        )
+
+        # Wire callbacks into the peer's dispatch.
+        # NOTE on closure capture: a lambda like `lambda t, e: cb(e)` binds
+        # `cb` by *name* — by the time the lambda runs, `cb` may have been
+        # reassigned to the most recent value. We use a default-argument
+        # trick (`cb=...`) to capture the value at lambda-definition time.
+        if self.on_sensor is not None:
+            self._peer.on(sensor_topic, lambda t, e, cb=self.on_sensor: cb(e))
+        if self.on_processed is not None:
+            self._peer.on(processed_topic, lambda t, e, cb=self.on_processed: cb(e))
+        if self.on_status is not None:
+            self._peer.on(status_topic, lambda t, e, cb=self.on_status: cb(e))
+
         await self._peer.start()
         _log.info(
             f"user triangle live: robot={robot_endpoint}, player={player_endpoint}"

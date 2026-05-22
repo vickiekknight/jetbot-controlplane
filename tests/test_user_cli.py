@@ -161,22 +161,23 @@ def test_connect_to_nonexistent_robot_exits_nonzero():
 
 def test_connect_to_existing_robot_opens_session(monkeypatch):
     """
-    Happy path: robot exists, cloud accepts the session, CLI opens the
-    WebSocket and waits. We monkeypatch open_user_signaling to return
-    immediately so the test doesn't block forever.
+    Happy path: robot exists, cloud accepts the session, CLI's UserSession
+    drives the handshake.
+
+    We monkeypatch UserSession.events to yield a single "ended" event and
+    exit. signaling_loop sees the "ended:" prefix and calls stop.set(),
+    which causes the outer asyncio.wait to return and the input_loop to
+    be cancelled cleanly without ever calling _stdin_lines / blocking on
+    real terminal input.
     """
     runner = CliRunner()
     with _LiveCloud() as cloud:
         cloud.app.state.registry.register("robot-1", metadata={})
 
-        # Patch the signaling iterator to be empty — opens WS, yields
-        # nothing, returns. The CLI then prints "disconnected" and exits.
-        async def fake_signaling(ws_url, stop):
-            # Return an empty async generator. We never enter the body.
-            return
-            yield  # pragma: no cover
+        async def fake_events(self, stop):
+            yield "ended:test-short-circuit"
 
-        monkeypatch.setattr("user.cli.open_user_signaling", fake_signaling)
+        monkeypatch.setattr("user.cli.UserSession.events", fake_events)
 
         result = runner.invoke(
             cli_app,
