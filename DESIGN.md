@@ -1,6 +1,6 @@
 # JetBot Control Plane — Design Document
 
-**For setup instructions, running examples, and the test/benchmark commands, see README.md.**
+**For setup instructions, running examples, and the test/benchmark commands, see [README.md.](README.md.)**
 
 ## 1. Framing
 
