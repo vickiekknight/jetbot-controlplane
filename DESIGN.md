@@ -25,11 +25,6 @@ Three coordination concerns live in three separate modules, each owning exactly 
 Splitting these is better than one god-object for two reasons. First, each module has a single reason to change: if I ever swap the in-memory Registry for Redis, the SessionManager and ConnectionManager don't need to know. Second, the boundaries between modules are explicit in code: when the SessionOrchestrator needs to send a message to a robot's WebSocket, it has to go through the ConnectionManager, which makes the data flow visible and auditable. One conflated class would hide all of that behind attribute access.
 
 ### 2.2 Idempotent identity assertions
-- Replace-on-duplicate registration.
-- Replace-on-duplicate WebSocket attachment.
-- Why "last write wins" is the right call when identity is unauthenticated.
-- When it would be wrong (authenticated identities) and how the design accommodates that future change.
-
 Registration is replace-on-duplicate: a robot claiming an ID always succeeds, overwriting any prior entry. The same principle applies one layer up at WebSocket level. For instance, if a robot opens a new WebSocket while a prior one was still attached, the prior one is closed and the new one takes its place. The justificaiton is that crashes happen, network partitions happen, and the cloud cannot reliably distinguish "robot is still alive" from "robot has crashed" without wall-clock heartbeat timeouts. Forcing strict rejection on duplicate would mean a restarted robot is locked out of the system because the previous incarnation of itself didn't clean up properly. The only escape from that bind is heartbeat-driven eviction, which produces unacceptable post-crash blackout windows.
 
 Replace-on-duplicate trades a theoretical impersonation vulnerability for a robust crash-recovery story. The vulnerability is theoretical because identity here is unauthenticated, as robots self-declare their `--id` via CLI, and the cloud accepts any string. A production system with cryptographic identities would invert this trade-off: if a robot's identity is signed by a hardware token, replace-on-duplicate becomes a denial-of-service vector, and strict rejection becomes the right call. The registry's API would accept that change without disturbing the rest of the system.
@@ -47,11 +42,6 @@ Three lifecycles, three owners, no overlap. The Player is session-scoped: the cl
 ## 3. Middleware Choice
 
 ### 3.1 Why ZeroMQ
-- Peer-to-peer topology fits the spec's "three pub/sub servers" wording literally.
-- No broker process to operate.
-- Transport-agnostic (IPC vs TCP) behind one API.
-- Topic filtering at the wire level (prefix match on first frame).
-
 ZeroMQ fits the spec's "three pub/sub servers" wording literally. Each entity binds a PUB socket on a known endpoint and connects SUB sockets to the other entities' PUB endpoints. Topic filtering is built in via byte-prefix matching on the first frame. There is no separate broker process to operate, monitor, or scale — each pub/sub server is just my process binding a socket. Transport is configurable behind one API: IPC (Unix domain sockets) for single-machine deployments, TCP for cross-host, with the rest of the system treating endpoint strings as opaque.
 
 For the scale of this take-home, ZMQ is the right call. If I were to scale to 25K+ concurrent robots, I would transition to a federated broker model (NATS clusters or MQTT with regional brokers) and probably a separate control plane (gRPC). The framing matters: for this take-home's specific architecture, ZMQ matches the requirements exactly with no impedance mismatch. For the production system this take-home is a tiny version of, broker-based messaging becomes the right answer for different reasons — persistence, fan-out at scale, operational maturity.
